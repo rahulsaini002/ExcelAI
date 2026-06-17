@@ -9,6 +9,9 @@ env/
 # Environment / secrets
 .env
 
+# Generated result files (served via /download; safe to delete)
+.sumio_results/
+
 # OS
 .DS_Store
 Thumbs.db

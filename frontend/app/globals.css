@@ -1,26 +1,66 @@
 @import "tailwindcss";
 
+/* Class-based dark mode: `dark:` utilities apply when <html> has class "dark". */
+@custom-variant dark (&:where(.dark, .dark *));
+
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #f6f7f9;
+  --foreground: #18181b;
+}
+
+.dark {
+  --background: #0a0a0b;
+  --foreground: #ededed;
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial,
+    sans-serif;
 }
+
+/* --- motion --- */
+@keyframes fadeInUp {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes popIn {
+  0% { opacity: 0; transform: scale(0.96); }
+  100% { opacity: 1; transform: scale(1); }
+}
+@keyframes blink {
+  0%, 80%, 100% { opacity: 0.25; }
+  40% { opacity: 1; }
+}
+.msg-in { animation: fadeInUp 0.28s cubic-bezier(0.22, 1, 0.36, 1) both; }
+.pop-in { animation: popIn 0.18s ease-out both; }
+.fade-in { animation: fadeIn 0.25s ease-out both; }
+
+@media (prefers-reduced-motion: reduce) {
+  .msg-in, .pop-in, .fade-in { animation: none; }
+}
+
+/* --- thin, subtle scrollbars --- */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(130, 130, 145, 0.35) transparent;
+}
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-thumb {
+  background: rgba(130, 130, 145, 0.35);
+  border-radius: 9999px;
+}
+*::-webkit-scrollbar-thumb:hover { background: rgba(130, 130, 145, 0.6); }
+*::-webkit-scrollbar-track { background: transparent; }
+
+::selection { background: rgba(99, 102, 241, 0.25); }
