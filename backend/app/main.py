@@ -163,9 +163,15 @@ async def undo(session_id: str = Form(...)) -> JSONResponse:
 
 
 @app.post("/inspect")
-async def inspect(files: list[UploadFile] = File(...)) -> JSONResponse:
+async def inspect(
+    files: list[UploadFile] = File(...),
+    session_id: str = Form(""),
+) -> JSONResponse:
     """Read uploaded file(s) and return their structure (sheets, columns + types,
-    row count, sample rows) so the UI can show a preview BEFORE any operation."""
+    row count, sample rows) so the UI can show a preview BEFORE any operation.
+
+    If a `session_id` is given, the loaded data is ALSO remembered for that session
+    so the two-phase flow (/parse then /execute) can reuse it without re-uploading."""
     if not files:
         return _error("Please upload a spreadsheet.", status=400)
     too_big = _too_big(files)
@@ -178,6 +184,13 @@ async def inspect(files: list[UploadFile] = File(...)) -> JSONResponse:
         return _error(str(exc), status=400)
     except Exception:
         return _error(_INTERNAL_ERROR, status=500)
+
+    # Remember the upload for the session so /parse + /execute can use it.
+    if session_id:
+        _remember_session(
+            session_id,
+            {"tables": dict(data.tables), "primary": data.primary, "exts": dict(data.exts)},
+        )
 
     tables = []
     for name, df in data.tables.items():
@@ -198,6 +211,237 @@ async def inspect(files: list[UploadFile] = File(...)) -> JSONResponse:
             }
         )
     return JSONResponse({"status": "ok", "tables": tables})
+
+
+def _describe_plan(operations: list[dict]) -> str:
+    """A deterministic one-line plain-language restatement of a plan, used when the
+    model didn't provide its own 'translation' (e.g. the offline fallback parser)."""
+    parts: list[str] = []
+    for op in operations:
+        a = op.get("action")
+        cols = ", ".join(op.get("columns") or [])
+        if a == "sort":
+            order = (op.get("orders") or ["asc"])[0]
+            parts.append(
+                f"sort by {cols or 'the chosen column'} "
+                f"({'high to low' if order == 'desc' else 'low to high'})"
+            )
+        elif a == "filter":
+            parts.append("keep only the rows matching your condition")
+        elif a == "limit":
+            parts.append(f"keep the {'last' if op.get('from_end') else 'top'} {op.get('count') or 'N'} rows")
+        elif a == "remove_duplicates":
+            parts.append("remove duplicate rows" + (f" on {cols}" if cols else ""))
+        elif a == "add_formula_column":
+            parts.append(f"add a '{op.get('name') or 'new'}' column")
+        elif a == "aggregate":
+            parts.append(f"{op.get('agg_func') or 'aggregate'} {op.get('agg_column') or ''}".strip())
+        elif a == "lookup":
+            parts.append(f"look up {op.get('return_column') or 'a value'} from another table")
+        elif a == "merge":
+            parts.append("merge the tables")
+        elif a in ("fill_missing", "drop_missing", "drop_invalid", "flag_missing"):
+            parts.append(a.replace("_", " ") + (f" in {cols}" if cols else ""))
+        else:
+            parts.append((a or "operation").replace("_", " "))
+    return ", then ".join(parts) if parts else "run the operation"
+
+
+@app.post("/parse")
+async def parse(
+    instruction: str = Form(...),
+    session_id: str = Form(""),
+    history: str = Form(""),
+) -> JSONResponse:
+    """Phase 1 of the two-phase flow: the Brain ONLY. Translate the instruction into an
+    operation plan WITHOUT executing it, so the UI can preview the interpretation +
+    confidence before running. Ambiguous -> clarify; unsupported -> message; the file is
+    never touched. /execute then runs the returned plan."""
+    instruction = (instruction or "").strip()
+    if not instruction:
+        return _error("Please describe what you'd like done to the data.", status=400)
+
+    entry = _SESSIONS.get(session_id) if session_id else None
+    if not entry or not entry.get("states"):
+        return _error("Please upload a spreadsheet to start.", status=400)
+    base = entry["states"][-1]
+    tables, primary = base["tables"], base["primary"]
+    structure = summarize_tables(tables, primary)
+
+    # Translate via the Brain (falling back to the deterministic parser if it's down).
+    try:
+        plan = llm.parse_instruction(instruction, structure, history)
+    except Exception as exc:
+        unavailable = isinstance(exc, llm.ModelUnavailableError)
+        key_missing = isinstance(exc, RuntimeError) and not unavailable
+        if not (unavailable or key_missing):
+            traceback.print_exc()
+        plan = fallback.parse(instruction, structure)
+        if plan is None:
+            if unavailable:
+                return _error(str(exc), status=503)
+            if key_missing:
+                return _error(str(exc), status=500)
+            return _error(
+                "I couldn't reach the AI service to understand your request right now — "
+                "this isn't a problem with your instruction. Please try again in a moment.",
+                status=502,
+            )
+
+    clarification = plan.get("clarification")
+    reply = plan.get("reply")
+    operations = plan.get("operations") or []
+    if not operations:
+        if reply:
+            return JSONResponse({"status": "message", "message": reply})
+        if clarification:
+            return JSONResponse({"status": "clarify", "clarification": clarification})
+        return JSONResponse(
+            {
+                "status": "message",
+                "message": (
+                    "I didn't understand that — try describing the task, e.g. "
+                    '"sort by Revenue descending" or "remove duplicate rows".'
+                ),
+            }
+        )
+
+    translation = (plan.get("translation") or "").strip() or _describe_plan(operations)
+    confidence = plan.get("confidence")
+    if not isinstance(confidence, int) or not (0 <= confidence <= 100):
+        confidence = 80
+    return JSONResponse(
+        {
+            "status": "plan",
+            "translation": translation,
+            "confidence": confidence,
+            # The full plan the UI hands back to /execute (no second Brain call).
+            "plan": {"operations": operations, "title": (plan.get("title") or "").strip() or None},
+        }
+    )
+
+
+def _run_operations(
+    session_id: str, base: dict, operations: list[dict], ai_title, started_at: float
+) -> JSONResponse:
+    """Run an operation plan on a base state, push the new state, serialize, and build
+    the OK response. Shared shape with /process (deltas, formulas, preview, partial
+    warnings, streamed download). Returns a friendly 422 on an expected step failure or
+    500 on an unexpected bug. Trusted code runs the plan — the model never executes."""
+    tables, primary, exts = base["tables"], base["primary"], base["exts"]
+
+    partial_warning = None
+    try:
+        result, result_name, notes, render_ops = execute_multi(tables, primary, operations)
+    except MultiStepError as exc:
+        # A later step failed: keep the file reflecting the completed steps (PRD MS-b).
+        result, result_name = exc.partial_result, exc.partial_name
+        notes, render_ops = exc.notes, exc.format_ops
+        done = exc.failed_step - 1
+        partial_warning = (
+            f"Step {exc.failed_step} couldn't be done: {exc.reason} "
+            f"Your file reflects the {done} step{'s' if done != 1 else ''} that "
+            "completed before it — fix that step and try again."
+        )
+    except OperationError as exc:
+        return _error(str(exc), status=422)
+    except Exception:
+        return _error(_INTERNAL_ERROR, status=500)
+
+    # Push the new state so the next instruction chains on it (and Retry/Edit can branch).
+    if session_id:
+        if isinstance(result, dict):
+            new_state = {
+                "tables": {**tables, **result},
+                "primary": next(iter(result)),
+                "exts": {**exts, **{k: "xlsx" for k in result}},
+            }
+        else:
+            new_state = {
+                "tables": {**tables, result_name: result},
+                "primary": result_name,
+                "exts": {**exts, result_name: exts.get(result_name, "xlsx")},
+            }
+        _push_state(session_id, new_state)
+
+    biggest = max((len(t) for t in tables.values()), default=0)
+    if biggest > 50_000:
+        notes = [
+            f"Heads up: this is a large file (~{biggest:,} rows) — it still processed, "
+            "but big files can take a little longer."
+        ] + notes
+
+    try:
+        if isinstance(result, dict):
+            out_bytes, out_name, media_type = _serialize_workbook(result, result_name)
+            row_count = sum(int(len(d)) for d in result.values())
+        else:
+            out_ext, upgrade_note = _output_ext(exts.get(result_name, "xlsx"), render_ops)
+            if upgrade_note:
+                notes = notes + [upgrade_note]
+            out_bytes, out_name, media_type = _serialize(result, result_name, out_ext, render_ops)
+            row_count = int(len(result))
+    except Exception:
+        return _error(_INTERNAL_ERROR, status=500)
+
+    download_id = _store_result(out_bytes, out_name, media_type)
+    inline_b64 = (
+        base64.b64encode(out_bytes).decode("ascii")
+        if len(out_bytes) <= _INLINE_MAX_BYTES else None
+    )
+    return JSONResponse(
+        {
+            "status": "ok",
+            "session_id": session_id,
+            "explanation": " ".join(notes) if notes else "No changes were needed.",
+            "notes": notes,
+            "formulas": _describe_formulas(render_ops),
+            "row_count": row_count,
+            "rows_before": int(len(tables[primary])) if primary in tables else None,
+            "preview": _result_preview(result, result_name),
+            "actions": list(dict.fromkeys(op.get("action") for op in operations)),
+            "ai_title": ai_title,
+            "partial": partial_warning is not None,
+            "warning": partial_warning,
+            "filename": out_name,
+            "media_type": media_type,
+            "file_size": len(out_bytes),
+            "elapsed_ms": int((time.time() - started_at) * 1000),
+            "download_id": download_id,
+            "file_base64": inline_b64,
+        }
+    )
+
+
+@app.post("/execute")
+async def execute(
+    session_id: str = Form(...),
+    plan: str = Form(...),
+    rewind: int = Form(-1),
+) -> JSONResponse:
+    """Phase 2 of the two-phase flow: the Hands ONLY. Run an already-approved plan
+    (from /parse) on the session's data with NO model call. Same result shape as
+    /process. The plan's columns/types are validated by the executor before it runs."""
+    started_at = time.time()
+
+    entry = _SESSIONS.get(session_id) if session_id else None
+    if not entry or not entry.get("states"):
+        return _error("Please upload a spreadsheet to start.", status=400)
+    states = entry["states"]
+    if 0 <= rewind < len(states):
+        del states[rewind + 1:]  # Retry/Edit: branch from an earlier step
+    base = states[-1]
+
+    try:
+        parsed = json.loads(plan)
+    except Exception:
+        return _error("That plan couldn't be read — please try running again.", status=400)
+    operations = parsed.get("operations") or []
+    if not operations:
+        return _error("There's nothing to run.", status=400)
+    ai_title = (parsed.get("title") or "").strip() or None
+
+    return _run_operations(session_id, base, operations, ai_title, started_at)
 
 
 @app.post("/process")
