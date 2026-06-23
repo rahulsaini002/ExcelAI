@@ -133,6 +133,12 @@ class OperationPlan(BaseModel):
     # A short 3-6 word English title summarizing the task, used to name the session
     # in the sidebar (e.g. "Sort sales by revenue").
     title: Optional[str] = None
+    # A one-line plain-language restatement of what the plan does, shown to the user
+    # BEFORE running (the "AI Translation" preview), e.g. "Filter Class equals 1,
+    # then sort by Amount (high to low)".
+    translation: Optional[str] = None
+    # How confident you are in this interpretation, an integer 0-100.
+    confidence: Optional[int] = None
 
 
 SYSTEM_PROMPT = """\
@@ -312,6 +318,12 @@ clarification if it's still unclear after using the conversation.
 - TITLE: whenever you output operations, ALSO set "title" to a short 3-6 word English \
 title that names the task, for the session list (e.g. "Sort sales by revenue", "Remove \
 duplicate emails", "Add profit column"). Keep it concise; no quotes, no trailing period.
+- TRANSLATION + CONFIDENCE: whenever you output operations, ALSO set "translation" to a \
+ONE-LINE plain-language restatement (in English) of what you will do, so the user can \
+confirm before it runs — e.g. "Filter rows where Class equals 1, then sort by Amount \
+(high to low)". And set "confidence" to an integer 0-100 for how sure you are of this \
+interpretation: high (90+) when the columns and intent are unambiguous, lower when you \
+had to guess which column or value was meant.
 - Otherwise leave "clarification" and "reply" empty/null.
 """
 

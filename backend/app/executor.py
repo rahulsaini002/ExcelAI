@@ -122,6 +122,8 @@ def _apply_one(
     elif action == "format_cells":
         note, directive = _format_cells(df, op)
         return df, note, directive
+    elif action == "set_cells":
+        df, note = _set_cells(df, op)
     else:
         raise OperationError(f"Unknown operation: {action!r}")
     return df, note, None
@@ -719,6 +721,67 @@ def _trim(df: pd.DataFrame, op: dict) -> tuple[pd.DataFrame, str]:
     if changed == 0:
         return df, "No extra spaces found to trim."
     return df, f"Trimmed extra spaces in {changed} cell{'s' if changed != 1 else ''}."
+
+
+def _coerce_like(series: pd.Series, value):
+    """Coerce an incoming (string) edit to fit the column's kind, so a numeric column
+    stays numeric and a date column stays dates (keeps formulas/formatting working).
+    Blank → NaN; otherwise falls back to the raw string."""
+    if value is None:
+        return float("nan")
+    s = str(value).strip()
+    if s == "":
+        return float("nan")
+    if pd.api.types.is_datetime64_any_dtype(series):
+        dt = _to_datetime(pd.Series([s])).iloc[0]
+        if pd.notna(dt):
+            return dt
+    elif pd.api.types.is_numeric_dtype(series) or _is_numeric_like(series):
+        num = pd.to_numeric(s, errors="coerce")
+        if pd.notna(num):
+            f = float(num)
+            return int(f) if f.is_integer() else f
+    return s
+
+
+def _set_cells(df: pd.DataFrame, op: dict) -> tuple[pd.DataFrame, str]:
+    """Apply manual cell edits from the grid. `edits` is a list of
+    {row, column, value} where `row` is the 0-based position in the table. Values are
+    coerced to the column's type; rows outside the table are skipped (the preview only
+    shows a sample). This op is built by the UI from the user's edits — the AI never
+    emits it — so it runs straight through /execute."""
+    edits = op.get("edits") or []
+    if not isinstance(edits, list) or not edits:
+        raise OperationError("No cell edits were provided.")
+
+    # Validate columns up front so a typo changes nothing.
+    wanted = [e.get("column") for e in edits if isinstance(e, dict) and e.get("column")]
+    _require_columns(df, list(dict.fromkeys(wanted)))
+
+    out = df.copy()
+    changed = 0
+    for e in edits:
+        if not isinstance(e, dict):
+            continue
+        col = e.get("column")
+        row = e.get("row")
+        if col not in out.columns:
+            continue
+        if not isinstance(row, int) or isinstance(row, bool) or row < 0 or row >= len(out):
+            continue  # row is outside the visible sample — skip silently
+        loc = out.columns.get_loc(col)
+        value = _coerce_like(out[col], e.get("value"))
+        try:
+            out.iat[row, loc] = value
+        except (ValueError, TypeError):
+            # dtype clash (e.g. NaN into an int column) — relax the column to object
+            out[col] = out[col].astype(object)
+            out.iat[row, loc] = value
+        changed += 1
+
+    if changed == 0:
+        return out, "No cells were updated (those rows are outside the preview)."
+    return out, f"Updated {changed} cell{'s' if changed != 1 else ''}."
 
 
 def _is_numeric_like(series: pd.Series) -> bool:
