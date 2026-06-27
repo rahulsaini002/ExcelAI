@@ -48,3 +48,13 @@ CORS_ORIGINS = [
     for origin in os.getenv("SUMIO_CORS_ORIGINS", "http://localhost:3000").split(",")
     if origin.strip()
 ]
+
+# In dev we allow ANY origin so the app works from localhost, 127.0.0.1, or a LAN IP.
+# In production set SUMIO_CORS_ALLOW_ALL=0 so only the origins in SUMIO_CORS_ORIGINS
+# (your deployed frontend) can call the API.
+CORS_ALLOW_ALL = os.getenv("SUMIO_CORS_ALLOW_ALL", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
