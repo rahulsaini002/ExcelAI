@@ -141,6 +141,50 @@ class OperationPlan(BaseModel):
     confidence: Optional[int] = None
 
 
+# --- Dashboard generation -------------------------------------------------------
+
+# How to COMPUTE a widget's number(s) from the real data (filled in by trusted code,
+# not the model — the model only chooses the agg + columns).
+class WidgetMetric(BaseModel):
+    agg: Literal["sum", "mean", "count", "count_distinct", "min", "max"]
+    column: Optional[str] = None  # column to aggregate (omit for a plain row count)
+    group_by: Optional[str] = None  # charts: aggregate per value of this column
+    format: Optional[Literal["number", "currency", "percent"]] = None
+
+
+# One widget on a generated dashboard. Mirrors the frontend Widget shape.
+class DashboardWidget(BaseModel):
+    type: Literal["kpi", "chart", "table"]
+    title: str
+    value: Optional[str] = None  # kpi headline, e.g. "₹4.82M"
+    delta: Optional[str] = None  # kpi change, e.g. "+12%"
+    chart_type: Optional[
+        Literal[
+            "bar", "line", "area", "pie", "scatter", "heatmap",
+            "waterfall", "pareto", "treemap", "gauge",
+        ]
+    ] = None
+    span: Optional[int] = 1  # 1 = half width, 2 = full width (frontend clamps)
+    # How to compute this widget from the data (kpi + chart). The backend uses this to
+    # fill in real numbers when a data file is provided.
+    metric: Optional[WidgetMetric] = None
+
+
+class DashboardSpec(BaseModel):
+    widgets: list[DashboardWidget]
+    title: Optional[str] = None  # short 3-6 word dashboard name
+
+
+# Maps one existing report block (by its position) to how its number(s) are computed.
+class ReportBlockMetric(BaseModel):
+    index: int
+    metric: Optional[WidgetMetric] = None
+
+
+class ReportMetricsPlan(BaseModel):
+    items: list[ReportBlockMetric]
+
+
 SYSTEM_PROMPT = """\
 You are the parsing brain of a conversational spreadsheet assistant. You convert a \
 user's plain-language instruction into a small, structured operation plan. You do \
@@ -368,6 +412,120 @@ def parse_instruction(instruction: str, structure: dict, history: str = "") -> d
     if isinstance(plan, OperationPlan):
         return plan.model_dump()
     return OperationPlan.model_validate_json(response.text).model_dump()
+
+
+DASHBOARD_SYSTEM_PROMPT = """\
+You design a small analytics dashboard for a conversational spreadsheet app. Given the \
+user's request and the COLUMNS available in their data, return a set of 4-6 dashboard \
+widgets that best answer the request.
+
+Widget types:
+- "kpi": a single headline number. Set "title" (e.g. "Total Revenue"), a short "value" \
+(e.g. "₹4.82M", "18,204", "92%") and an optional "delta" (e.g. "+12%", "-3%"). Base the \
+metric on a REAL column when one fits; the value/delta are illustrative sample figures.
+- "chart": set "title" and a "chart_type" from: bar, line, area, pie, scatter, heatmap, \
+waterfall, pareto, treemap, gauge. Pick the type that suits the data (trend over time -> \
+line; share of a whole -> pie; ranking -> bar/pareto; correlation -> scatter; \
+part-to-whole hierarchy -> treemap; a single rate -> gauge).
+- "table": a detail breakdown. Set "title".
+
+METRICS — for every "kpi" and "chart" widget, ALSO set "metric" describing HOW to compute \
+it from the REAL columns (trusted code computes the actual numbers):
+- "agg": one of sum, mean, count, count_distinct, min, max.
+- "column": the column to aggregate. Omit it only for a plain row count (agg "count").
+- "group_by": CHARTS ONLY — the column to group rows by, so the chart shows the aggregate \
+per group (e.g. a "Revenue by Region" bar chart -> agg sum, column Revenue, group_by Region).
+- "format": how to show a KPI — "currency" (money columns), "percent", or "number".
+Examples: "Total Revenue" -> {agg: sum, column: Revenue, format: currency}; "Orders" -> \
+{agg: count, format: number}; "Avg Order Value" -> {agg: mean, column: Amount, format: \
+currency}; "Customers" -> {agg: count_distinct, column: Customer}. Only use columns that \
+EXIST in the structure; pick numeric columns for sum/mean/min/max.
+
+Rules:
+- Use the user's ACTUAL column names in titles where it makes sense (e.g. if there is a \
+"Region" column, "Revenue by Region"). If no columns are given, design a sensible generic \
+dashboard for the request and you may omit "metric".
+- Start with 2-3 KPI cards, then 2-3 charts, optionally 1 table.
+- "span" is 1 (half width) or 2 (full width). Use 2 for a primary trend chart or a wide \
+table; 1 otherwise.
+- Also set the dashboard "title": a short 3-6 word name.
+- Return ONLY the structured fields. Do not invent spreadsheet operations or prose.
+"""
+
+
+def generate_dashboard(prompt: str, structure: dict) -> dict:
+    """Design a dashboard (a set of widgets) from a prompt + the data's columns.
+
+    Returns a dict shaped like DashboardSpec. Raises ModelUnavailableError when the
+    model is rate-limited, so the caller can fall back to a local template.
+    """
+    if structure:
+        context = "Columns available in the user's data:\n" + json.dumps(
+            structure, ensure_ascii=False, indent=2
+        )
+    else:
+        context = "No specific columns were provided; design a sensible generic dashboard."
+    user_content = f"{context}\n\nDashboard request:\n{prompt}"
+
+    gen_config = types.GenerateContentConfig(
+        system_instruction=DASHBOARD_SYSTEM_PROMPT,
+        temperature=0.4,
+        response_mime_type="application/json",
+        response_schema=DashboardSpec,
+    )
+    response = _generate_with_retry(user_content, gen_config)
+
+    spec = response.parsed
+    if isinstance(spec, DashboardSpec):
+        return spec.model_dump()
+    return DashboardSpec.model_validate_json(response.text).model_dump()
+
+
+REPORT_METRICS_SYSTEM_PROMPT = """\
+You map each block of a business report to a metric computed from the user's data columns.
+For each KPI, CHART, or TABLE block, return its "index" and a "metric":
+- "agg": sum, mean, count, count_distinct, min, max.
+- "column": the column to aggregate. Omit only for a plain row count (agg "count").
+- "group_by": for CHART and TABLE blocks, the column to group rows by (e.g. Region).
+- "format": currency (money), percent, or number — how to show a KPI.
+Base each metric on the block's TITLE: e.g. a "Revenue by Region" table/chart -> agg sum, \
+column Revenue, group_by Region; "Total Orders" KPI -> agg count; "Avg Deal Size" -> agg \
+mean, column Amount, format currency. Use ONLY columns that exist in the structure; pick \
+numeric columns for sum/mean/min/max. For NARRATIVE blocks, omit them (no metric). Return \
+one item per block that should show a real number.
+"""
+
+
+def assign_report_metrics(blocks: list[dict], structure: dict) -> dict:
+    """Map each report block (by index) to a metric over the real columns. Returns a
+    dict shaped like ReportMetricsPlan. Raises ModelUnavailableError if rate-limited."""
+    summary = [
+        {
+            "index": i,
+            "type": b.get("type"),
+            "title": b.get("title"),
+            "chart_type": b.get("chartType"),
+        }
+        for i, b in enumerate(blocks)
+    ]
+    user_content = (
+        "Report blocks:\n"
+        + json.dumps(summary, ensure_ascii=False, indent=2)
+        + "\n\nData columns:\n"
+        + json.dumps(structure, ensure_ascii=False, indent=2)
+    )
+    gen_config = types.GenerateContentConfig(
+        system_instruction=REPORT_METRICS_SYSTEM_PROMPT,
+        temperature=0,
+        response_mime_type="application/json",
+        response_schema=ReportMetricsPlan,
+    )
+    response = _generate_with_retry(user_content, gen_config)
+
+    plan = response.parsed
+    if isinstance(plan, ReportMetricsPlan):
+        return plan.model_dump()
+    return ReportMetricsPlan.model_validate_json(response.text).model_dump()
 
 
 def _generate_with_retry(user_content: str, gen_config: types.GenerateContentConfig):

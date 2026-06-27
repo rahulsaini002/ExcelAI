@@ -1,0 +1,11 @@
+# Keep the image small and free of local-only / secret files.
+.venv
+__pycache__
+*.pyc
+.env
+.sumio_results
+test_*.py
+.git
+.gitignore
+Dockerfile
+.dockerignore

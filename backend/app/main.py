@@ -23,6 +23,7 @@ import pandas as pd
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
+from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
@@ -35,14 +36,23 @@ from .reader import load_files, summarize_structure, summarize_tables
 
 app = FastAPI(title="Sumio API", version="0.1.0")
 
-app.add_middleware(
-    CORSMiddleware,
-    # Open for local dev so the browser is never blocked by CORS regardless of
-    # whether the page is served from localhost, 127.0.0.1, or the LAN IP.
-    allow_origin_regex=".*",
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Open for local dev (any localhost/127.0.0.1/LAN origin) so the browser is never
+# blocked by CORS. In production set SUMIO_CORS_ALLOW_ALL=0 to restrict to the origins
+# listed in SUMIO_CORS_ORIGINS (your deployed frontend).
+if config.CORS_ALLOW_ALL:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=".*",
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=config.CORS_ORIGINS,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
 # In-memory per-session working data, keyed by a session id from the frontend.
@@ -129,6 +139,347 @@ _load_results_index()
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok", "model": config.MODEL}
+
+
+def _abbrev(x: float) -> str:
+    """Compact human number: 4,820,000 -> 4.82M, 18204 -> 18.2K."""
+    ax = abs(x)
+    if ax >= 1_000_000:
+        return f"{x / 1_000_000:.2f}M"
+    if ax >= 1_000:
+        return f"{x / 1_000:.1f}K"
+    return f"{int(x)}" if x == int(x) else f"{x:.2f}"
+
+
+def _format_number(x: float, fmt: str | None) -> str:
+    if fmt == "percent":
+        return f"{x:.1f}%"
+    if fmt == "currency":
+        return "₹" + _abbrev(x)
+    if abs(x) >= 10_000:
+        return _abbrev(x)
+    return f"{int(x):,}" if x == int(x) else f"{x:,.2f}"
+
+
+def _compute_kpi(df: pd.DataFrame, metric: dict) -> str | None:
+    """Compute a single KPI value from the data, formatted for display."""
+    agg = metric.get("agg")
+    col = metric.get("column")
+    fmt = metric.get("format")
+    try:
+        if agg == "count":
+            return _format_number(float(len(df)), fmt or "number")
+        if not col or col not in df.columns:
+            return None
+        if agg == "count_distinct":
+            return _format_number(float(df[col].nunique()), fmt or "number")
+        series = pd.to_numeric(df[col], errors="coerce").dropna()
+        if series.empty:
+            return None
+        if agg == "sum":
+            val = float(series.sum())
+        elif agg in ("mean", "average"):
+            val = float(series.mean())
+        elif agg == "min":
+            val = float(series.min())
+        elif agg == "max":
+            val = float(series.max())
+        else:
+            return None
+        return _format_number(val, fmt)
+    except Exception:
+        return None
+
+
+def _compute_series(df: pd.DataFrame, metric: dict, top: int = 8) -> list[float]:
+    """Compute a numeric series (an aggregate per group) for a chart."""
+    agg = metric.get("agg")
+    col = metric.get("column")
+    gb = metric.get("group_by")
+    try:
+        if not gb or gb not in df.columns:
+            return []
+        if agg == "count" or not col or col not in df.columns:
+            grouped = df.groupby(gb).size()
+        else:
+            vals = pd.to_numeric(df[col], errors="coerce")
+            tmp = pd.DataFrame({"_g": df[gb].values, "_v": vals.values}).dropna(subset=["_v"])
+            g = tmp.groupby("_g")["_v"]
+            grouped = {
+                "sum": g.sum, "mean": g.mean, "average": g.mean, "min": g.min, "max": g.max,
+            }.get(agg, g.sum)()
+        grouped = grouped.sort_values(ascending=False).head(top)
+        return [round(float(v), 2) for v in grouped.tolist()]
+    except Exception:
+        return []
+
+
+def _compute_table(df: pd.DataFrame, metric: dict, top: int = 10) -> dict | None:
+    """Compute a small aggregated table (group_by + aggregate) for a report block."""
+    agg = metric.get("agg")
+    col = metric.get("column")
+    gb = metric.get("group_by")
+    fmt = metric.get("format")
+    try:
+        if not gb or gb not in df.columns:
+            return None
+        if agg == "count" or not col or col not in df.columns:
+            grouped = df.groupby(gb).size()
+            value_label = "Count"
+        else:
+            vals = pd.to_numeric(df[col], errors="coerce")
+            tmp = pd.DataFrame({"_g": df[gb].values, "_v": vals.values}).dropna(subset=["_v"])
+            g = tmp.groupby("_g")["_v"]
+            grouped = {
+                "sum": g.sum, "mean": g.mean, "average": g.mean, "min": g.min, "max": g.max,
+            }.get(agg, g.sum)()
+            value_label = f"{str(agg).title()} {col}"
+        grouped = grouped.sort_values(ascending=False).head(top)
+        rows = [[str(idx), _format_number(float(v), fmt)] for idx, v in grouped.items()]
+        return {"columns": [str(gb), value_label], "rows": rows}
+    except Exception:
+        return None
+
+
+@app.post("/dashboard")
+async def dashboard(
+    prompt: str = Form(...),
+    columns: str = Form(""),
+    files: list[UploadFile] = File(default=[]),
+) -> JSONResponse:
+    """Design a dashboard (a set of widgets) from a plain-language prompt. The Brain
+    chooses the widgets + a metric (agg + column) for each; if a DATA FILE is provided,
+    trusted code then computes the REAL numbers from it. On model failure the frontend
+    falls back to a local template, so we return a clear error here."""
+    prompt = (prompt or "").strip()
+    if not prompt:
+        return _error("Please describe the dashboard you'd like.", status=400)
+
+    # With a data file we compute real numbers; otherwise use the columns hint only.
+    df: pd.DataFrame | None = None
+    if files:
+        too_big = _too_big(files)
+        if too_big:
+            return _error(too_big, status=413)
+        uploads = [(f.filename or "upload", await f.read()) for f in files]
+        try:
+            data = load_files(uploads)
+        except ValueError as exc:
+            return _error(str(exc), status=400)
+        except Exception:
+            return _error(_INTERNAL_ERROR, status=500)
+        df = data.tables[data.primary]
+        structure = summarize_tables(data.tables, data.primary)
+    else:
+        # `columns` is an optional JSON array like [{"name": "...", "type": "..."}].
+        try:
+            structure = json.loads(columns) if columns.strip() else {}
+        except Exception:
+            structure = {}
+
+    try:
+        spec = llm.generate_dashboard(prompt, structure)
+    except Exception as exc:
+        unavailable = isinstance(exc, llm.ModelUnavailableError)
+        key_missing = isinstance(exc, RuntimeError) and not unavailable
+        if not (unavailable or key_missing):
+            traceback.print_exc()
+        if unavailable:
+            return _error(str(exc), status=503)
+        if key_missing:
+            return _error(str(exc), status=500)
+        return _error(
+            "I couldn't reach the AI service to build the dashboard right now — "
+            "please try again in a moment.",
+            status=502,
+        )
+
+    # Fill in REAL numbers from the data wherever the model gave a metric.
+    if df is not None:
+        for w in spec.get("widgets", []):
+            metric = w.get("metric")
+            if not metric:
+                continue
+            if w.get("type") == "kpi":
+                val = _compute_kpi(df, metric)
+                if val is not None:
+                    w["value"] = val
+                    w["delta"] = None  # real value — no fabricated change
+            elif w.get("type") == "chart" and metric.get("group_by"):
+                series = _compute_series(df, metric)
+                if series:
+                    w["data"] = series
+        spec["computed"] = True
+
+    return JSONResponse({"status": "ok", **spec})
+
+
+def _safe_filename(name: str) -> str:
+    """A safe download filename stem from a report title."""
+    return re.sub(r"[^\w\-]+", "_", (name or "").strip()).strip("_")[:40] or "report"
+
+
+def _build_report_xlsx(title: str, source: str, blocks: list[dict]) -> bytes:
+    """Render a report definition (title + ordered blocks) into a formatted .xlsx."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Report"
+    ws["A1"] = title
+    ws["A1"].font = Font(bold=True, size=16)
+    meta = [f"Source: {source}"] if source else []
+    meta.append(time.strftime("%d %b %Y"))
+    ws["A2"] = " · ".join(meta)
+    ws["A2"].font = Font(italic=True, color="888888")
+
+    row = 4
+    for b in blocks:
+        bt = b.get("type")
+        btitle = (b.get("title") or "").strip()
+        if bt == "kpi":
+            ws.cell(row=row, column=1, value=btitle or "Metric").font = Font(bold=True)
+            ws.cell(row=row, column=2, value=b.get("value") or "")
+            if b.get("delta"):
+                ws.cell(row=row, column=3, value=b.get("delta"))
+            row += 1
+        elif bt == "narrative":
+            ws.cell(row=row, column=1, value=btitle or "Narrative").font = Font(bold=True)
+            row += 1
+            ws.cell(row=row, column=1, value=b.get("text") or "")
+            row += 2
+        elif bt == "chart":
+            ws.cell(row=row, column=1, value=btitle or "Chart").font = Font(bold=True)
+            ws.cell(row=row, column=2, value=f"[{b.get('chartType') or 'chart'} chart]")
+            row += 2
+        elif bt == "table":
+            ws.cell(row=row, column=1, value=btitle or "Table").font = Font(bold=True)
+            row += 1
+            cols = b.get("columns") or []
+            for ci, col in enumerate(cols, start=1):
+                ws.cell(row=row, column=ci, value=col).font = Font(bold=True)
+            if cols:
+                row += 1
+            for r in b.get("rows") or []:
+                for ci, val in enumerate(r, start=1):
+                    ws.cell(row=row, column=ci, value=val)
+                row += 1
+            row += 1
+        else:
+            row += 1
+
+    ws.column_dimensions["A"].width = 32
+    ws.column_dimensions["B"].width = 20
+    ws.column_dimensions["C"].width = 14
+    _disarm_injection(ws)  # the report text is user-influenced — neutralize "=" cells
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+@app.post("/report/export")
+async def report_export(report: str = Form(...)) -> JSONResponse:
+    """Build a formatted .xlsx from a report definition (JSON: title, source, blocks)
+    and return it via the same download mechanism as processed files."""
+    try:
+        data = json.loads(report)
+    except Exception:
+        return _error("That report couldn't be read — please try again.", status=400)
+
+    title = (data.get("title") or "Report").strip() or "Report"
+    source = (data.get("source") or "").strip()
+    blocks = data.get("blocks") or []
+    try:
+        out_bytes = _build_report_xlsx(title, source, blocks)
+    except Exception:
+        traceback.print_exc()
+        return _error(_INTERNAL_ERROR, status=500)
+
+    filename = f"{_safe_filename(title)}.xlsx"
+    media = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    download_id = _store_result(out_bytes, filename, media)
+    inline = (
+        base64.b64encode(out_bytes).decode("ascii")
+        if len(out_bytes) <= _INLINE_MAX_BYTES else None
+    )
+    return JSONResponse({
+        "status": "ok",
+        "filename": filename,
+        "media_type": media,
+        "download_id": download_id,
+        "file_base64": inline,
+    })
+
+
+@app.post("/report/compute")
+async def report_compute(
+    blocks: str = Form(...),
+    files: list[UploadFile] = File(default=[]),
+) -> JSONResponse:
+    """Bind a report's blocks to a data file: the Brain assigns a metric per block, then
+    trusted code computes real KPI values, chart series, and table rows from the file."""
+    try:
+        block_list = json.loads(blocks)
+    except Exception:
+        return _error("That report couldn't be read — please try again.", status=400)
+    if not isinstance(block_list, list) or not block_list:
+        return _error("This report has no blocks to compute.", status=400)
+    if not files:
+        return _error("Please choose a data file to compute from.", status=400)
+
+    too_big = _too_big(files)
+    if too_big:
+        return _error(too_big, status=413)
+    uploads = [(f.filename or "upload", await f.read()) for f in files]
+    try:
+        data = load_files(uploads)
+    except ValueError as exc:
+        return _error(str(exc), status=400)
+    except Exception:
+        return _error(_INTERNAL_ERROR, status=500)
+    df = data.tables[data.primary]
+    structure = summarize_tables(data.tables, data.primary)
+
+    try:
+        plan = llm.assign_report_metrics(block_list, structure)
+    except Exception as exc:
+        unavailable = isinstance(exc, llm.ModelUnavailableError)
+        key_missing = isinstance(exc, RuntimeError) and not unavailable
+        if not (unavailable or key_missing):
+            traceback.print_exc()
+        if unavailable:
+            return _error(str(exc), status=503)
+        if key_missing:
+            return _error(str(exc), status=500)
+        return _error(
+            "I couldn't reach the AI service to compute the report — please try again.",
+            status=502,
+        )
+
+    metrics = {
+        it["index"]: it.get("metric")
+        for it in plan.get("items", [])
+        if isinstance(it.get("index"), int) and it.get("metric")
+    }
+    for i, b in enumerate(block_list):
+        metric = metrics.get(i)
+        if not metric:
+            continue
+        t = b.get("type")
+        if t == "kpi":
+            v = _compute_kpi(df, metric)
+            if v is not None:
+                b["value"] = v
+                b["delta"] = None
+        elif t == "chart" and metric.get("group_by"):
+            s = _compute_series(df, metric)
+            if s:
+                b["data"] = s
+        elif t == "table" and metric.get("group_by"):
+            tbl = _compute_table(df, metric)
+            if tbl:
+                b["columns"] = tbl["columns"]
+                b["rows"] = tbl["rows"]
+
+    return JSONResponse({"status": "ok", "blocks": block_list})
 
 
 @app.api_route("/download/{result_id}", methods=["GET", "HEAD"])
