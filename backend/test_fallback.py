@@ -126,6 +126,21 @@ check("col > N", op0("Amount > 5000")["conditions"][0] == {"column": "Amount", "
 check("col = text", op0("Region = North")["conditions"][0]["operator"] == "equals")
 check("contains", op0("Customer Name contains Rahul")["conditions"][0]["operator"] == "contains")
 
+# predictive analytics (Phase 3.5) — work offline too
+check("forecast", op0("forecast Revenue") == {"action": "forecast", "columns": ["Revenue"]})
+check("forecast next N + unit", op0("predict Revenue for the next 6 months") ==
+      {"action": "forecast", "columns": ["Revenue"], "count": 6, "period_unit": "month"})
+check("project keyword", act("project Amount forward")[0] == "forecast")
+check("anomalies (all cols)", op0("find anomalies") == {"action": "detect_anomalies"})
+check("anomalies in a column", op0("flag outliers in Revenue") ==
+      {"action": "detect_anomalies", "columns": ["Revenue"]})
+check("anomalies iqr method", op0("detect anomalies in Amount using iqr")["anomaly_method"] == "iqr")
+check("what-if percent up", op0("what if Revenue increases by 10%") ==
+      {"action": "what_if", "column": "Revenue", "formula": "{Revenue} * 1.1", "name": "Revenue (Scenario)"})
+check("what-if percent down", op0("simulate Amount decreased by 20%")["formula"] == "{Amount} * 0.8")
+check("what-if absolute", op0("what if Cost increases by 50")["formula"] == "{Cost} + 50")
+check("forecast needs a real column (defers)", p("forecast the future") is None)
+
 # DEFERS (returns None) — not confident
 check("defers on Hindi", p("रेवेन्यू के हिसाब से सॉर्ट करो") is None)
 check("defers on vague", p("do something clever with this data") is None)

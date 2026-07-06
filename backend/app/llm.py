@@ -57,12 +57,33 @@ class Condition(BaseModel):
 # Structured-output schema. Passing this to Gemini as the `response_schema`
 # constrains the reply to valid JSON in exactly this shape (no markdown, no prose).
 # Every action reuses a subset of these fields; unused ones stay null.
+
+
+# One KPI on a generated dashboard sheet (its value is computed by trusted code).
+class DashboardKpi(BaseModel):
+    label: str
+    agg: Literal["sum", "mean", "count", "count_distinct", "min", "max"]
+    column: Optional[str] = None  # omit only for a plain row count
+    format: Optional[Literal["number", "currency", "percent"]] = None
+
+
+# One chart on a generated dashboard sheet.
+class DashboardChartSpec(BaseModel):
+    chart_type: Literal["bar", "line", "pie", "area"]
+    x_column: str
+    y_columns: list[str]
+    title: Optional[str] = None
+
+
 class Operation(BaseModel):
     action: Literal[
         "sort", "filter", "limit", "remove_duplicates", "fill_missing", "drop_missing",
         "drop_invalid", "trim", "flag_missing", "add_formula_column", "lookup",
         "aggregate", "find_replace", "rename_columns", "drop_columns", "select_columns",
-        "format_cells", "merge", "combine_sheets",
+        "format_cells", "merge", "combine_sheets", "chart", "dashboard",
+        "unpivot", "pivot", "transpose",
+        # Phase 3.5 — Predictive analytics
+        "forecast", "what_if", "detect_anomalies",
     ]
     # Which table this operation acts on. Omit to use the current working table.
     table: Optional[str] = None
@@ -120,6 +141,40 @@ class Operation(BaseModel):
     sheet_tables: Optional[list[str]] = None
     # Synonym groups: unify differently-named columns that mean the same thing.
     column_groups: Optional[list[ColumnGroup]] = None
+    # chart (add a real Excel chart to the output file)
+    chart_type: Optional[Literal["bar", "line", "pie", "area"]] = None
+    x_column: Optional[str] = None
+    y_columns: Optional[list[str]] = None
+    chart_title: Optional[str] = None
+    # dashboard (assemble KPIs + charts + a summary onto one sheet)
+    dashboard_title: Optional[str] = None
+    kpis: Optional[list[DashboardKpi]] = None
+    charts: Optional[list[DashboardChartSpec]] = None
+    summary: Optional[str] = None
+    # unpivot (wide → long)
+    id_columns: Optional[list[str]] = None
+    value_columns: Optional[list[str]] = None
+    var_name: Optional[str] = None
+    value_name: Optional[str] = None
+    # pivot (long → wide); reuses agg_func
+    index_columns: Optional[list[str]] = None
+    pivot_column: Optional[str] = None
+    value_column: Optional[str] = None
+    # transpose
+    header_column: Optional[str] = None
+    # forecast (Phase 3.5)
+    date_column: Optional[str] = None   # time-axis column; omit to use row index
+    period_unit: Optional[Literal["day", "week", "month", "quarter", "year"]] = None
+    # forecast periods reuses `count`; forecast value columns reuse `columns`
+    # what_if (Phase 3.5) — reuses column, formula, name; scenario columns reuse columns
+    # detect_anomalies (Phase 3.5)
+    anomaly_method: Optional[Literal["zscore", "iqr"]] = None
+    anomaly_threshold: Optional[float] = None  # z-score threshold or IQR multiplier
+
+
+class StepSummary(BaseModel):
+    label: str                   # "Filter rows where Region equals North"
+    rationale: Optional[str] = None  # "Narrows data before aggregating"
 
 
 class OperationPlan(BaseModel):
@@ -139,6 +194,12 @@ class OperationPlan(BaseModel):
     translation: Optional[str] = None
     # How confident you are in this interpretation, an integer 0-100.
     confidence: Optional[int] = None
+    # Phase 3.4 — Agentic plan: one entry per operation (same order), giving
+    # a human-readable label and an optional rationale for each step.
+    steps: Optional[list[StepSummary]] = None
+    # One sentence explaining the overall approach, e.g. "Filter first to reduce
+    # the dataset, then aggregate for a focused summary." Omit for single-op plans.
+    plan_rationale: Optional[str] = None
 
 
 # --- Dashboard generation -------------------------------------------------------
@@ -312,6 +373,85 @@ new name (clarification). Only set "overwrite": true if they confirm overwriting
    - "sheet_tables": the list of table names to put on separate sheets
    - "new_table": optional name for the output file (defaults to "combined")
 
+16. chart — add a REAL chart to the output file (it does NOT change the data). Use for
+    "make/draw/plot a chart/graph" requests, e.g. "bar chart of revenue by month". Pick
+    the type that fits: bar = compare categories/rankings; line = a trend over time;
+    pie = share of a whole (one value column); area = cumulative trend.
+   - "chart_type": bar, line, pie, or area
+   - "x_column": the label/category column (x-axis), e.g. Month
+   - "y_columns": one or more NUMERIC value columns to plot (y-axis), e.g. Revenue
+   - "chart_title": optional title
+    If the file has MANY rows per category (e.g. "revenue by month" but several rows per
+    month), aggregate FIRST then chart — output an aggregate step, then a chart step.
+    Only bar/line/pie/area are supported; for any other chart type, decline via "reply".
+
+17. dashboard — assemble a one-page DASHBOARD (KPIs + charts + a short written summary)
+    onto a new sheet. Use for "make a dashboard", "one-page summary", "how's the shop
+    doing" requests. Trusted code computes the KPI numbers and lays everything out.
+   - "dashboard_title": optional title for the sheet
+   - "kpis": a list of headline metrics, each {"label": e.g. "Total Revenue", "agg":
+     sum/mean/count/count_distinct/min/max, "column": the column (omit only for a plain
+     count), "format": currency/percent/number}
+   - "charts": a list, each {"chart_type": bar/line/pie/area, "x_column", "y_columns":
+     [numeric column(s)], "title"}
+   - "summary": a short (1-3 sentence) plain-language summary of the data
+    If a chart needs aggregated data (e.g. revenue by month from many rows), add an
+    aggregate step BEFORE the dashboard so the chart's columns exist.
+
+18. unpivot — turn WIDE data into tidy LONG rows (e.g. monthly columns Jan/Feb/Mar →
+    rows with a Month column + a value column). Use for "unpivot", "melt", "columns to
+    rows", "make it long/tidy".
+   - "id_columns": columns to KEEP as-is (e.g. Region)
+   - "value_columns": the columns to turn into rows (e.g. Jan, Feb, Mar). Omit to use
+     all columns except the id_columns.
+   - "var_name": name for the new column holding the old column names (e.g. Month)
+   - "value_name": name for the new values column (e.g. Sales)
+
+19. pivot — summarize LONG data into a WIDE grid (e.g. rows of Region/Month/Sales → a
+    Region × Month grid of summed Sales). Use for "pivot", "pivot table", "rows to
+    columns", "summary grid".
+   - "index_columns": the row groups (e.g. Region)
+   - "pivot_column": the column whose values become new columns (e.g. Month)
+   - "value_column": the column to aggregate (e.g. Sales)
+   - "agg_func": sum (default), mean, count, min, or max
+
+20. transpose — flip the whole table: rows become columns and columns become rows.
+   - "header_column": optional — the column whose values become the new headers.
+
+21. forecast — extrapolate future values using a linear trend (requires ≥ 5 data points).
+    Use for "predict next N months", "forecast sales", "what will revenue be next quarter".
+   - "columns": the numeric column(s) to forecast (required)
+   - "date_column": the date/time column to use as the time axis (optional; omit to use
+     row order). Use the actual column name from the structure.
+   - "count": how many future periods to forecast (default 3)
+   - "period_unit": "day", "week", "month", "quarter", or "year" — the unit for the
+     generated future period labels (infer from the date column or the user's request)
+   Output adds forecast rows with "{col}_Forecast", "{col}_Lower95", "{col}_Upper95" columns.
+   NEVER use this for less than 5 rows — decline via "reply" if the data is too small.
+
+22. what_if — apply a hypothetical change to one column and show the impact on dependent
+    columns. Use for "what if price increases by 10%?", "simulate a 20% discount", "what
+    if I double marketing spend?".
+   - "column": the column whose value changes hypothetically (e.g. "Price")
+   - "formula": the expression for the new value of that column, using {column} for the
+     original value — e.g. "{Price} * 1.1" (10% increase), "{Cost} + 50"
+   - "name": label for the scenario column, e.g. "Price (Scenario)"
+   - "columns": optional list of dependent columns to recompute in the scenario
+     (each needs a matching formula in a follow-up add_formula_column if complex);
+     omit for a simple single-column scenario.
+   Output adds scenario columns showing before/after; a note summarises the impact.
+
+23. detect_anomalies — flag rows whose numeric values are unusually high or low.
+    Use for "find anomalies", "highlight outliers", "flag unusual values", "audit for
+    inconsistencies" in numeric columns.
+   - "columns": the numeric column(s) to check for anomalies (required)
+   - "anomaly_method": "zscore" (default, flags |z| > threshold) or "iqr" (flags
+     values outside Q1 − multiplier×IQR … Q3 + multiplier×IQR)
+   - "anomaly_threshold": z-score cutoff (default 3.0) or IQR multiplier (default 1.5)
+   Output adds "Is_Anomaly" (True/False) and "Anomaly_Note" (which column + direction)
+   columns. Rows that are perfectly normal show False / blank.
+   NEVER use this for less than 5 rows — decline via "reply" if the data is too small.
+
 Rules:
 - Use the EXACT column and table names given in the structure. Match the user's intent \
 to real columns/tables even if they describe them loosely.
@@ -328,10 +468,11 @@ pick a sensible default): set "clarification" to ONE short question (in the user
 language) and leave "operations" empty. Do NOT ask about things you can reasonably \
 infer (e.g. that two different-column files should be merged side by side).
 - UNSUPPORTED request (something outside the operations above, e.g. predict/forecast \
-sales, make a chart, pivot table, send an email): do NOT clarify and do NOT invent a \
+sales, send an email): do NOT clarify and do NOT invent a \
 result. Put a friendly explanation in the "reply" field, like: "I can't do that yet — \
 but I can sort, filter, remove duplicates, add formula columns, look up, aggregate, \
-find & replace, rename/drop columns, merge, or combine sheets." Leave "operations" empty.
+find & replace, rename/drop columns, merge, combine sheets, chart, build a dashboard, \
+or reshape (pivot/unpivot/transpose)." Leave "operations" empty.
 - NON-EXISTENT column/table: if the user names a column or table that isn't in the \
 structure (even loosely), do NOT invent it. Ask in "clarification" and list the real \
 column/table names so they can pick (e.g. "I don't see a 'Profit' column — did you mean \
@@ -359,6 +500,10 @@ carry out the ORIGINAL request using that answer. BUT if this message is clearly
 self-contained instruction (it names its own action/column), treat it on its OWN — do \
 NOT re-apply an earlier unfinished request or re-ask its question. Only fall back to a \
 clarification if it's still unclear after using the conversation.
+- TEAM GLOSSARY: you may be given a "Team glossary" with the team's own definitions \
+(e.g. ARR = {MRR} * 12) and formatting preferences. When the user uses a defined term, \
+APPLY that meaning consistently — e.g. "add ARR" with ARR defined as {MRR} * 12 means \
+add_formula_column name "ARR" formula "{MRR} * 12". Honour stated formatting preferences.
 - TITLE: whenever you output operations, ALSO set "title" to a short 3-6 word English \
 title that names the task, for the session list (e.g. "Sort sales by revenue", "Remove \
 duplicate emails", "Add profit column"). Keep it concise; no quotes, no trailing period.
@@ -368,6 +513,16 @@ confirm before it runs — e.g. "Filter rows where Class equals 1, then sort by 
 (high to low)". And set "confidence" to an integer 0-100 for how sure you are of this \
 interpretation: high (90+) when the columns and intent are unambiguous, lower when you \
 had to guess which column or value was meant.
+- STEPS: whenever you output operations, ALSO populate "steps" — a parallel list, one \
+entry per operation in the SAME ORDER. Each entry has: "label" — a plain-English \
+phrase (under 12 words) describing what that step does, e.g. "Filter rows where Region \
+equals North", "Sort by Revenue, highest first", "Remove duplicate rows on Email"; and \
+"rationale" — one sentence (under 15 words) explaining WHY this step is needed in the \
+plan, e.g. "Narrows to the target region before aggregating", "Puts the most important \
+results first". Omit "rationale" only when the reason is entirely obvious from the label.
+- PLAN_RATIONALE: when you output 2 or more operations, also set "plan_rationale" to \
+one sentence explaining the OVERALL approach, e.g. "Filter first to reduce the dataset, \
+then aggregate for a focused summary." Omit for single-operation plans.
 - Otherwise leave "clarification" and "reply" empty/null.
 """
 
@@ -384,7 +539,8 @@ def _client() -> genai.Client:
 def parse_instruction(instruction: str, structure: dict, history: str = "") -> dict:
     """Translate a plain-language instruction into an operation plan dict.
 
-    `history` is recent conversation text so a follow-up instruction can be
+    `history` is recent conversation text (and, prepended by the caller, the team's
+    learned glossary + preferences — Phase 3.12) so a follow-up instruction can be
     interpreted in context. Returns a dict shaped like OperationPlan.
     """
     parts = [
@@ -526,6 +682,70 @@ def assign_report_metrics(blocks: list[dict], structure: dict) -> dict:
     if isinstance(plan, ReportMetricsPlan):
         return plan.model_dump()
     return ReportMetricsPlan.model_validate_json(response.text).model_dump()
+
+
+_OCR_PROMPT = """\
+Extract the table(s) from this image as CSV.
+
+Rules:
+- The FIRST ROW of each table must be the header row with column names.
+- Use commas to separate values. Quote any cell containing a comma with double quotes.
+- Strip leading and trailing whitespace from every cell.
+- If there are MULTIPLE separate tables, separate them with a line that reads exactly:
+  --- Table N ---  (where N is 1, 2, 3 …)
+- If NO table is visible (only text paragraphs, charts, logos, or too blurry):
+  output exactly: NO_TABLE_FOUND
+- Output ONLY the CSV data (and any separator lines). No prose, no markdown.
+
+Example — one table:
+Name,Score,Grade
+Alice,92,A
+Bob,78,B+
+
+Example — two tables:
+--- Table 1 ---
+Name,Score
+--- Table 2 ---
+Month,Revenue
+Jan,5200
+"""
+
+
+def ocr_image(image_bytes: bytes, mime_type: str) -> str:
+    """Use Gemini Vision to extract table data from an image.
+
+    Returns a CSV string (possibly multi-table with '--- Table N ---' separators)
+    or the sentinel string 'NO_TABLE_FOUND' when no table is visible.
+    Raises ModelUnavailableError when the model is rate-limited after retries.
+    """
+    client = _client()
+    parts = [
+        types.Part.from_text(text=_OCR_PROMPT),
+        types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+    ]
+    gen_config = types.GenerateContentConfig(temperature=0)
+    last_exc: errors.APIError | None = None
+
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            response = client.models.generate_content(
+                model=config.MODEL,
+                contents=parts,
+                config=gen_config,
+            )
+            return response.text or "NO_TABLE_FOUND"
+        except errors.APIError as exc:
+            if getattr(exc, "code", None) not in _RETRYABLE_CODES:
+                raise
+            last_exc = exc
+            if attempt < _MAX_ATTEMPTS - 1:
+                time.sleep(2**attempt + random.uniform(0, 0.5))
+
+    raise ModelUnavailableError(
+        "The AI service is rate-limited right now (the free tier has a usage cap). "
+        "This isn't a problem with your file or instruction — please wait a bit and try "
+        "again. If it keeps happening, the daily free limit may be used up."
+    ) from last_exc
 
 
 def _generate_with_retry(user_content: str, gen_config: types.GenerateContentConfig):

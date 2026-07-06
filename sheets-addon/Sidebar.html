@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top" />
+    <style>
+      body { font-family: -apple-system, Roboto, Arial, sans-serif; margin: 0; padding: 12px; color: #1f2937; }
+      h1 { font-size: 15px; margin: 0 0 2px; }
+      .sub { font-size: 11px; color: #6b7280; margin: 0 0 12px; }
+      textarea { width: 100%; box-sizing: border-box; resize: vertical; padding: 8px; font-size: 13px;
+                 border: 1px solid #d1d5db; border-radius: 8px; }
+      button { font-size: 13px; padding: 7px 12px; border-radius: 8px; border: 1px solid #d1d5db;
+               background: #fff; cursor: pointer; }
+      button.primary { background: #4f46e5; border-color: #4f46e5; color: #fff; }
+      button:disabled { opacity: .5; cursor: default; }
+      .row { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+      .card { margin-top: 12px; padding: 10px; border: 1px solid #e5e7eb; border-radius: 8px; font-size: 13px; }
+      .muted { color: #6b7280; font-size: 12px; }
+      .ok { color: #047857; } .warn { color: #b45309; } .err { color: #b91c1c; }
+      .mono { font-family: ui-monospace, Menlo, monospace; font-size: 11px; white-space: pre-wrap; }
+      ul { margin: 6px 0 0; padding-left: 18px; }
+      .badge { display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 999px; background: #eef2ff; color: #4f46e5; }
+    </style>
+  </head>
+  <body>
+    <h1>Sumio</h1>
+    <p class="sub">Edit this sheet in plain language. Same Sumio brain, working on your live sheet.</p>
+
+    <textarea id="instruction" rows="3" placeholder="e.g. Sort by Revenue (high to low), then remove duplicate rows"></textarea>
+    <div class="row">
+      <button id="run" class="primary" onclick="run()">Ask Sumio</button>
+      <span id="status" class="muted"></span>
+    </div>
+
+    <div id="result"></div>
+
+    <script>
+      var current = null; // { plan, baseHash }
+
+      function setStatus(t) { document.getElementById('status').textContent = t || ''; }
+      function esc(s) { return String(s == null ? '' : s).replace(/[&<>]/g, function (c) { return { '&':'&amp;','<':'&lt;','>':'&gt;' }[c]; }); }
+
+      function run() {
+        var instr = document.getElementById('instruction').value.trim();
+        if (!instr) return;
+        current = null;
+        document.getElementById('result').innerHTML = '';
+        document.getElementById('run').disabled = true;
+        setStatus('Thinking…');
+        google.script.run.withSuccessHandler(onPlan).withFailureHandler(onFail).planRequest(instr);
+      }
+
+      function onPlan(resp) {
+        document.getElementById('run').disabled = false;
+        setStatus('');
+        var el = document.getElementById('result');
+
+        if (!resp || resp.status === 'error') return show(el, 'err', (resp && resp.error) || 'Something went wrong.');
+        if (resp.status === 'message') return show(el, 'muted', resp.message);
+        if (resp.status === 'clarify') return show(el, 'warn', resp.clarification);
+
+        var ops = (resp.plan && resp.plan.operations) || [];
+        var steps = (resp.plan && resp.plan.steps) || null;
+        var html = '';
+
+        if (resp.status === 'suggestion' || resp.can_edit === false) {
+          html += '<div class="card"><span class="badge">view-only</span><br/>';
+          html += '<b>Sumio suggests:</b> ' + esc(resp.translation);
+          html += stepList(steps, ops);
+          html += '<p class="muted">You have view-only access, so Sumio can\'t edit this sheet — share these steps with an editor.</p></div>';
+          el.innerHTML = html;
+          return;
+        }
+
+        current = { plan: resp.plan, baseHash: resp.base_hash };
+        html += '<div class="card"><b>Plan:</b> ' + esc(resp.translation);
+        if (typeof resp.confidence === 'number') html += ' <span class="muted">(' + resp.confidence + '% sure)</span>';
+        html += stepList(steps, ops);
+        if (resp.shielded_columns && resp.shielded_columns.length) {
+          html += '<p class="muted">🛡️ Hid sensitive columns from the AI: ' + esc(resp.shielded_columns.join(', ')) + '</p>';
+        }
+        if (resp.destructive) {
+          html += '<p class="warn">⚠ ' + esc(resp.summary) + '</p>';
+          html += '<div class="row"><button class="primary" onclick="apply(true)">Apply anyway</button>'
+               +  '<button onclick="cancel()">Cancel</button></div>';
+        } else {
+          html += '<div class="row"><button class="primary" onclick="apply(false)">Apply to sheet</button>'
+               +  '<button onclick="cancel()">Cancel</button></div>';
+        }
+        html += '</div>';
+        el.innerHTML = html;
+      }
+
+      function stepList(steps, ops) {
+        var items = steps && steps.length ? steps.map(function (s) { return s.label; })
+                                          : ops.map(function (o) { return o.action; });
+        if (items.length < 2) return '';
+        return '<ul>' + items.map(function (i) { return '<li>' + esc(i) + '</li>'; }).join('') + '</ul>';
+      }
+
+      function apply(confirm) {
+        if (!current) return;
+        document.querySelectorAll('button').forEach(function (b) { b.disabled = true; });
+        setStatus('Applying…');
+        google.script.run.withSuccessHandler(onApplied).withFailureHandler(onFail)
+          .applyRequest(current.plan, current.baseHash, confirm);
+      }
+
+      function onApplied(resp) {
+        setStatus('');
+        var el = document.getElementById('result');
+        if (!resp || resp.status === 'error') return show(el, 'err', (resp && resp.error) || 'Apply failed.');
+        if (resp.status === 'conflict') return show(el, 'warn', resp.message + ' (Ask Sumio again.)');
+        if (resp.status === 'confirm_required') {
+          show(el, 'warn', '⚠ ' + resp.summary +
+            ' <div class="row"><button class="primary" onclick="apply(true)">Confirm</button>' +
+            '<button onclick="cancel()">Cancel</button></div>');
+          return;
+        }
+        if (resp.status === 'applied') {
+          var msg = '<span class="ok">✓ ' + esc(resp.explanation) + '</span>';
+          if (resp.partial) msg += '<p class="warn">' + esc(resp.warning) + '</p>';
+          msg += '<p class="muted">' + resp.row_count + ' row(s) now in the sheet.</p>';
+          el.innerHTML = '<div class="card">' + msg + '</div>';
+        }
+      }
+
+      function cancel() {
+        current = null;
+        document.getElementById('result').innerHTML = '';
+      }
+      function onFail(e) {
+        document.getElementById('run').disabled = false;
+        setStatus('');
+        show(document.getElementById('result'), 'err', (e && e.message) || 'Could not reach Sumio.');
+      }
+      function show(el, cls, html) { el.innerHTML = '<div class="card ' + cls + '">' + html + '</div>'; }
+    </script>
+  </body>
+</html>

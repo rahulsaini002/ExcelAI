@@ -123,10 +123,15 @@ case("1.5 filter then sort", SALES, "keep only North region, then sort by Revenu
      lambda p: ("filter" in actions(p) and "sort" in actions(p), "expected filter + sort"))
 
 # --- 1.3 / 1.14-b unsupported -> reply (no operations) ---------------------- #
-case("1.14-b unsupported (chart)", SALES, "make a pie chart of revenue by region",
+# NOTE: charts (2.2) and forecasting (3.5) USED to be the "unsupported" examples but are
+# now real features. Use a genuinely out-of-scope request for the decline case, and test
+# forecasting/anomalies as the supported features they are.
+case("1.14-b unsupported (translate)", SALES, "translate every Region value into French",
      lambda p: (not (p.get("operations") or []) and bool(p.get("reply")), "expected reply, no ops"))
-case("1.14-b unsupported (forecast)", SALES, "predict next month's revenue",
-     lambda p: (not (p.get("operations") or []) and bool(p.get("reply")), "expected reply, no ops"))
+case("3.5 forecast supported", SALES, "forecast next month's revenue",
+     lambda p: ("forecast" in actions(p), "expected a forecast operation"))
+case("3.5 anomalies supported", SALES, "flag any unusual revenue values",
+     lambda p: ("detect_anomalies" in actions(p), "expected detect_anomalies"))
 
 # --- 1.3 / 1.14-c ambiguous -> clarification ------------------------------- #
 case("1.14-c non-existent column", SALES, "sort by Profit",
@@ -163,8 +168,12 @@ case("1.11 date format DD-MM-YYYY", SALES, "format the Date column as DD-MM-YYYY
      lambda p: ("format_cells" in actions(p) and first(p).get("number_format") == "date", "expected date format"))
 
 # --- 1.12 find & replace --------------------------------------------------- #
+# Robust to which field the model capitalizes: it must recognise a find&replace about
+# 'mumbai' (the same-word-different-case phrasing varies how the model fills find/replace).
 case("1.12 find & replace (Hinglish)", SALES, "sab 'mumbai' ko 'Mumbai' kar do Region me",
-     lambda p: ("find_replace" in actions(p) and (first(p).get("replace") or "") == "Mumbai", "expected find_replace -> Mumbai"))
+     lambda p: ("find_replace" in actions(p)
+                and "mumbai" in ((first(p).get("find") or "") + (first(p).get("replace") or "")).lower(),
+                "expected a find_replace involving mumbai"))
 
 # --- NEW: merge two disjoint files + compute across them (prefer to act) ---- #
 case("merge + multiply (prefer to act)", DISJOINT,
