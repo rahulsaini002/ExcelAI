@@ -74,7 +74,8 @@ class LoadedData:
     """
     tables: dict[str, pd.DataFrame]
     primary: str
-    exts: dict[str, str]  # table name -> "csv" or "xlsx" (for choosing output format)
+    exts: dict[str, str]   # table name -> "csv" / "xlsx" / "pdf" (for output format)
+    notes: dict[str, str]  # table name -> per-table notice (e.g. OCR warning)
 
 
 def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -159,7 +160,8 @@ def load_spreadsheet(data: bytes, filename: str) -> LoadedSheet:
         return LoadedSheet(df=first, filename=filename, ext="xlsx", sheets=sheets)
 
     raise ValueError(
-        "Unsupported file type. Please upload an Excel (.xlsx, .xlsm, .xls) or CSV file."
+        "Unsupported file type. Please upload an Excel (.xlsx, .xlsm, .xls), CSV, "
+        "PDF, or image file."
     )
 
 
@@ -181,31 +183,85 @@ def _unique_name(name: str, taken: dict) -> str:
     return f"{name} ({i})"
 
 
+# Extensions routed to the PDF reader (pdfplumber + Gemini Vision fallback).
+_PDF_EXTS = {".pdf"}
+
+# Extensions routed directly to Gemini Vision OCR.
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".gif", ".webp"}
+
+# MIME type map for image extensions (needed by the Gemini Vision call).
+_IMAGE_MIME: dict[str, str] = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".tiff": "image/tiff",
+    ".tif": "image/tiff",
+    ".bmp": "image/bmp",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+
+
 def load_files(files: list[tuple[str, bytes]]) -> LoadedData:
     """Load several uploaded files into one namespace of named tables.
 
+    Accepts spreadsheets (.csv/.xlsx/.xlsm/.xls), PDFs, and images.
     A single-sheet file becomes one table named after the file. A multi-sheet
     workbook becomes one table per sheet, named "<file> - <sheet>".
+    PDF and image files are extracted into named tables (OCR when needed).
     """
+    from . import pdf_reader  # deferred to avoid circular import at module level
+
     tables: dict[str, pd.DataFrame] = {}
     exts: dict[str, str] = {}
+    notes: dict[str, str] = {}
     primary: str | None = None
 
     for filename, data in files:
-        loaded = load_spreadsheet(data, filename)
-        base = _base_name(filename)
-        multi = len(loaded.sheets) > 1
-        for sheet_name, df in loaded.sheets.items():
-            label = f"{base} - {sheet_name}" if multi else base
-            label = _unique_name(label, tables)
-            tables[label] = df
-            exts[label] = loaded.ext
-            if primary is None:
-                primary = label
+        name_lower = (filename or "").lower()
+        suffix = "." + name_lower.rsplit(".", 1)[-1] if "." in name_lower else ""
+
+        if suffix in _PDF_EXTS:
+            # PDF: pdfplumber first, Gemini Vision OCR fallback.
+            extracted = pdf_reader.load_pdf(filename, data)
+            for label, df, note in extracted:
+                label = _unique_name(label, tables)
+                tables[label] = df
+                exts[label] = "pdf"
+                if note:
+                    notes[label] = note
+                if primary is None:
+                    primary = label
+
+        elif suffix in _IMAGE_EXTS:
+            # Image: Gemini Vision OCR.
+            mime = _IMAGE_MIME.get(suffix, "image/png")
+            extracted = pdf_reader.load_image(filename, data, mime)
+            for label, df, note in extracted:
+                label = _unique_name(label, tables)
+                tables[label] = df
+                exts[label] = "pdf"  # treat same as pdf for output purposes
+                if note:
+                    notes[label] = note
+                if primary is None:
+                    primary = label
+
+        else:
+            # Spreadsheet: existing path.
+            loaded = load_spreadsheet(data, filename)
+            base = _base_name(filename)
+            multi = len(loaded.sheets) > 1
+            for sheet_name, df in loaded.sheets.items():
+                label = f"{base} - {sheet_name}" if multi else base
+                label = _unique_name(label, tables)
+                tables[label] = df
+                exts[label] = loaded.ext
+                if primary is None:
+                    primary = label
 
     if not tables:
         raise ValueError("No readable spreadsheet data was found in the upload.")
-    return LoadedData(tables=tables, primary=primary, exts=exts)
+    return LoadedData(tables=tables, primary=primary, exts=exts, notes=notes)
 
 
 def summarize_tables(tables: dict[str, pd.DataFrame], primary: str) -> dict:

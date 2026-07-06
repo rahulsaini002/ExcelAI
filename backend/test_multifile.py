@@ -134,5 +134,48 @@ check("compute across two merged files aligns by row",
       list(df["Roll x Qty"]) == [2, 33, 48], str(list(df["Roll x Qty"])))
 check("merge note explains side-by-side", any("side by side" in n for n in notes), str(notes))
 
+# --- 2.1: conflicting data types flagged on merge ---
+# "Amount" is numbers in one file but text in another — must be flagged, not silent.
+num_amt = pd.DataFrame({"CustID": [1, 2], "Amount": [100, 200]})
+txt_amt = pd.DataFrame({"CustID": [3, 4], "Amount": ["N/A", "pending"]})
+df, name, notes, _ = execute_multi({"num_amt": num_amt, "txt_amt": txt_amt}, "num_amt",
+    [{"action": "merge", "merge_tables": ["num_amt", "txt_amt"], "new_table": "all"}])
+check("merge still succeeds with mixed types", len(df) == 4, f"{len(df)} rows")
+check("conflicting data types are flagged",
+      any("numbers in some files and text in others" in n for n in notes), str(notes))
+
+# Edge: no false alarm when a shared column is numeric in BOTH files.
+n1 = pd.DataFrame({"CustID": [1], "Amount": [10]})
+n2 = pd.DataFrame({"CustID": [2], "Amount": [20]})
+df, name, notes, _ = execute_multi({"n1": n1, "n2": n2}, "n1",
+    [{"action": "merge", "merge_tables": ["n1", "n2"]}])
+check("no type-conflict flag when columns agree",
+      not any("numbers in some files and text" in n for n in notes), str(notes))
+
+# Edge: mismatched column counts — keep the union, leave missing values blank.
+wide = pd.DataFrame({"CustID": [1], "Amount": [10], "Region": ["North"]})
+narrow = pd.DataFrame({"CustID": [2], "Amount": [20]})
+df, name, notes, _ = execute_multi({"wide": wide, "narrow": narrow}, "wide",
+    [{"action": "merge", "merge_tables": ["wide", "narrow"], "new_table": "all"}])
+check("mismatched column counts keep the union",
+      set(df.columns) == {"CustID", "Amount", "Region"} and len(df) == 2, f"cols={list(df.columns)}")
+check("missing column left blank for the narrow file",
+      bool(pd.isna(df.loc[df["CustID"] == 2, "Region"]).all()), str(df.to_dict("records")))
+
+# Failure: merge needs at least two tables.
+try:
+    execute_multi({"only": num_amt}, "only", [{"action": "merge", "merge_tables": ["only"]}])
+    check("merge with <2 tables errors", False, "no error")
+except OperationError:
+    check("merge with <2 tables errors", True)
+
+# Failure: merge naming a table that doesn't exist.
+try:
+    execute_multi({"num_amt": num_amt, "txt_amt": txt_amt}, "num_amt",
+        [{"action": "merge", "merge_tables": ["num_amt", "ghost"]}])
+    check("merge with unknown table errors", False, "no error")
+except OperationError:
+    check("merge with unknown table errors", True)
+
 print(f"\n{passed} passed, {failed} failed.")
 raise SystemExit(1 if failed else 0)

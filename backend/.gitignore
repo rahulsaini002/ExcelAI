@@ -12,6 +12,14 @@ env/
 # Generated result files (served via /download; safe to delete)
 .sumio_results/
 
+# Local SQLite database (dev only; production uses Postgres via DATABASE_URL)
+sumio.db
+*.sqlite
+*.sqlite3
+
+# Persisted team memory (definitions/preferences/templates) — runtime data, not code
+data/
+
 # OS
 .DS_Store
 Thumbs.db

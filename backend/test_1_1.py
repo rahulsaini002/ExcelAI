@@ -94,12 +94,19 @@ check("type: date detected", types["when"] == "date", str(types))
 d = load("empty.csv", b"A,B\n")
 check("1.1-g empty -> 0 rows, no crash", summarize_structure(d.tables["empty"])["row_count"] == 0)
 
-# 1.1-h Wrong file type
+# 1.1-h Wrong file type (genuinely unsupported — PDFs/images ARE supported since 3.1)
 try:
-    load("pic.pdf", b"%PDF-1.4 not a sheet")
+    load("notes.txt", b"hello world")
     check("1.1-h wrong type rejected", False, "no error")
 except ValueError as e:
     check("1.1-h wrong type message", "Excel" in str(e) and "CSV" in str(e), str(e))
+
+# 1.1-h2 a junk PDF is a SUPPORTED type with bad content -> friendly PDF-specific error
+try:
+    load("pic.pdf", b"%PDF-1.4 not a sheet")
+    check("1.1-h2 junk PDF rejected", False, "no error")
+except ValueError as e:
+    check("1.1-h2 junk PDF friendly error", "PDF" in str(e), str(e))
 
 # 1.1-i Corrupted xlsx
 try:

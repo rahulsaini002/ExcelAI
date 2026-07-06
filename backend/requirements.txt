@@ -7,3 +7,23 @@ xlrd==2.0.1
 google-genai==1.21.1
 pydantic==2.10.6
 python-dotenv==1.0.1
+pdfplumber==0.11.10
+PyMuPDF==1.27.2.3
+python-pptx==1.0.2
+
+# Persistence: SQLAlchemy works on both SQLite (local dev) and Postgres (Render).
+SQLAlchemy==2.0.36
+# Postgres driver — used in production only (local dev uses SQLite, no driver needed).
+psycopg2-binary==2.9.10
+
+# Auth: bcrypt password hashing, JWT login tokens, email format validation,
+# google-auth verifies "Sign in with Google" ID tokens (also a google-genai dep).
+bcrypt==4.2.1
+PyJWT==2.10.1
+email-validator==2.2.0
+google-auth==2.54.0
+
+# Optional live-connector clients (app/drivers.py lazy-imports them; uncomment to enable).
+# Postgres works via psycopg2-binary above; these add MySQL / Snowflake.
+# PyMySQL==1.1.1
+# snowflake-connector-python==3.12.3

@@ -89,6 +89,9 @@ def _parse_segment(text: str, structure: dict, columns: list[str]) -> list[dict]
     if not low:
         return []
     matchers = (
+        # Predictive analytics first — their trigger words are distinctive, so they
+        # take priority over the generic matchers (Phase 3.5).
+        _m_forecast, _m_what_if, _m_detect_anomalies,
         _m_remove_duplicates, _m_fill_missing, _m_drop_missing, _m_drop_invalid,
         _m_flag_missing, _m_trim, _m_rename, _m_drop_columns, _m_select_columns,
         _m_find_replace, _m_format, _m_formula, _m_aggregate, _m_merge, _m_lookup,
@@ -101,12 +104,15 @@ def _parse_segment(text: str, structure: dict, columns: list[str]) -> list[dict]
     return []
 
 
-def parse(instruction: str, structure: dict) -> dict | None:
+def parse(instruction: str, structure: dict, definitions: dict | None = None) -> dict | None:
     """Return an OperationPlan-shaped dict for one OR MORE simple commands, else None.
 
     A multi-line / multi-clause message is split and each command parsed independently,
     so several actions run in one go. Commands it can't confidently parse are skipped
-    (so e.g. "Create Tax column" with no formula doesn't block the others)."""
+    (so e.g. "Create Tax column" with no formula doesn't block the others).
+
+    `definitions` is the team's learned glossary (Phase 3.12): a segment naming a defined
+    term with a formula is expanded to that team formula even offline."""
     text = (instruction or "").strip()
     columns = _columns(structure)
     if not text or not columns:
@@ -114,8 +120,25 @@ def parse(instruction: str, structure: dict) -> dict | None:
 
     ops: list[dict] = []
     for segment in _split(text):
+        expanded = _expand_definition(segment, definitions) if definitions else None
+        if expanded:
+            ops.extend(expanded)
+            continue
         ops.extend(_parse_segment(segment, structure, columns))
     return {"operations": ops} if ops else None
+
+
+def _expand_definition(segment: str, definitions: dict) -> list[dict] | None:
+    """A segment like 'add ARR' where ARR is a defined formula → the team's formula."""
+    low = segment.lower()
+    if not re.search(r"\b(add|create|make|new|calculate|compute)\b", low):
+        return None
+    out: list[dict] = []
+    for term, d in definitions.items():
+        formula = d.get("formula") if isinstance(d, dict) else None
+        if formula and re.search(rf"\b{re.escape(term.lower())}\b", low):
+            out.append({"action": "add_formula_column", "name": term, "formula": formula})
+    return out or None
 
 
 # --------------------------------------------------------------------------- #
@@ -364,6 +387,56 @@ def _m_limit(text, low, columns, structure):
     if top:
         return {"action": "limit", "count": int(top.group(1))}
     return None
+
+
+def _m_forecast(text, low, columns, structure):
+    if not re.search(r"\b(forecast|predict|projection|project|extrapolate)\b", low):
+        return None
+    col = _find_column(low, columns)
+    if not col:
+        return None
+    op = {"action": "forecast", "columns": [col]}
+    m = re.search(r"\bnext\s+(\d+)\b", low) or re.search(r"\b(\d+)\s+(?:day|week|month|quarter|year)", low)
+    if m:
+        op["count"] = int(m.group(1))
+    mu = re.search(r"\b(day|week|month|quarter|year)s?\b", low)
+    if mu:
+        op["period_unit"] = mu.group(1)
+    return op
+
+
+def _m_detect_anomalies(text, low, columns, structure):
+    if not re.search(r"\b(anomal\w*|outlier\w*|unusual|abnormal)\b", low):
+        return None
+    op = {"action": "detect_anomalies"}
+    cols = _columns_in_order(low, columns)
+    if cols:
+        op["columns"] = cols
+    if "iqr" in low:
+        op["anomaly_method"] = "iqr"
+    return op
+
+
+def _m_what_if(text, low, columns, structure):
+    if "what if" not in low and not re.search(r"\bsimulat", low):
+        return None
+    col = _find_column(low, columns)
+    if not col:
+        return None
+    # "increase/decrease <col> by N%" or "... by N" — conservative numeric scenario.
+    # Stems (not whole words) so "increases", "decreased", "growing" all match.
+    m = re.search(r"\b(increas|rais|grow|grew|decreas|lower|reduc|cut|drop)\w*\s+.*?\bby\s+"
+                  r"(\d+(?:\.\d+)?)\s*(%?)", low)
+    if not m:
+        return None
+    stem, amt, pct = m.group(1), float(m.group(2)), m.group(3) == "%"
+    sign = 1 if stem in ("increas", "rais", "grow", "grew") else -1
+    if pct:
+        factor = 1 + sign * amt / 100
+        formula = "{" + col + "} * " + f"{factor:g}"
+    else:
+        formula = "{" + col + "} " + ("+" if sign > 0 else "-") + f" {amt:g}"
+    return {"action": "what_if", "column": col, "formula": formula, "name": f"{col} (Scenario)"}
 
 
 def _m_filter(text, low, columns, structure):
