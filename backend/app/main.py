@@ -50,9 +50,9 @@ _PLACEHOLDER = re.compile(r"\{([^{}]+)\}")
 
 from . import (
     apikeys, audit, auth, collab, compliance, config, connectors, digest, distribution,
-    execsummary, exports, fallback, guardrails, kg, lineage, llm, marketplace, oidc, org,
-    permissions, personalization, pii, quality, scale, selfheal, slack, solver, store, sync,
-    voice, workflow,
+    execsummary, exports, fallback, guardrails, kg, lineage, llm, marketplace, oidc,
+    oplog, org, permissions, personalization, pii, quality, scale, selfheal, slack, solver,
+    store, sync, voice, workflow,
 )
 from .db import init_db, session_scope
 from .executor import MultiStepError, OperationError, execute_multi, _resolve_sheet_name
@@ -309,6 +309,20 @@ _load_results_index()
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok", "model": config.MODEL}
+
+
+@app.get("/debug/oplog")
+def debug_oplog(limit: int = 100, run_id: str = "", phase: str = "") -> dict:
+    """Recent Operation Plans, executions and outcomes (Track 4 item 5).
+
+    Pass `run_id` (returned on every successful /execute) to see one run's plan and
+    outcome together — the view that actually answers a bug report. Records what the
+    system DID: actions, column names, row deltas, durations. Never cell values, and the
+    instruction is stored PII-redacted.
+    """
+    if run_id:
+        return {"run_id": run_id, "events": oplog.run(run_id)}
+    return {"events": oplog.events(limit=limit, phase=phase or None)}
 
 
 @app.get("/brain/version")
@@ -1076,6 +1090,7 @@ async def parse(
     context = (glossary + "\n\n" + history).strip() if glossary else history
 
     # Translate via the Brain (falling back to the deterministic parser if it's down).
+    used_fallback = False
     try:
         plan = llm.parse_instruction(instruction, structure, context)
     except Exception as exc:
@@ -1083,6 +1098,7 @@ async def parse(
         key_missing = isinstance(exc, RuntimeError) and not unavailable
         if not (unavailable or key_missing):
             traceback.print_exc()
+        used_fallback = True
         plan = fallback.parse(instruction, structure, personalization.effective_definitions(team_id, org_id or None))
         if plan is None:
             if unavailable:
@@ -1099,6 +1115,18 @@ async def parse(
     clarification = plan.get("clarification")
     reply = plan.get("reply")
     operations = plan.get("operations") or []
+    # Track 4 item 5: record what the Brain proposed BEFORE anything acts on it — a plan
+    # that was never run is exactly what you need when the complaint is "it misunderstood
+    # me". `source` distinguishes the real Brain from the offline fallback parser.
+    oplog.record_plan(
+        oplog.new_run_id(),
+        session_id=session_id,
+        instruction=instruction,
+        operations=operations,
+        source="fallback" if used_fallback else "brain",
+        status=("plan" if operations else ("clarify" if clarification else "message")),
+        confidence=plan.get("confidence") if isinstance(plan.get("confidence"), int) else None,
+    )
     if not operations:
         if reply:
             return JSONResponse({"status": "message", "message": reply})
@@ -1192,6 +1220,15 @@ def _run_operations(
     500 on an unexpected bug. Trusted code runs the plan — the model never executes."""
     tables, primary, exts = base["tables"], base["primary"], base["exts"]
 
+    # Track 4 item 5: one run_id ties this execution to its plan and its outcome, so a
+    # later "it dropped my rows" can be answered from the recorded row delta + plan shape
+    # instead of guesswork. Overlapping requests stay distinguishable.
+    run_id = oplog.new_run_id()
+    rows_before = sum(int(len(d)) for d in tables.values())
+    oplog.record_plan(
+        run_id, session_id=session_id, operations=operations, source="user", status="executing"
+    )
+
     partial_warning = None
     completed_steps = len(operations)  # all steps ran unless a later one fails
     failed_step = None
@@ -1222,8 +1259,17 @@ def _run_operations(
                 "completed before it — fix that step and try again."
             )
         except OperationError as exc:
+            oplog.record_outcome(
+                run_id, status="error", rows_before=rows_before,
+                duration_ms=int((time.time() - started_at) * 1000), error=str(exc),
+            )
             return _error(str(exc), status=422)
-        except Exception:
+        except Exception as exc:
+            oplog.record_outcome(
+                run_id, status="error", rows_before=rows_before,
+                duration_ms=int((time.time() - started_at) * 1000),
+                error=f"unexpected {type(exc).__name__}: {exc}",
+            )
             return _error(_INTERNAL_ERROR, status=500)
         else:
             scale.RESULT_CACHE.put(_sig, (result, result_name, notes, render_ops))
@@ -1263,8 +1309,24 @@ def _run_operations(
                 notes = notes + [upgrade_note]
             out_bytes, out_name, media_type = _serialize(result, result_name, out_ext, render_ops)
             row_count = int(len(result))
-    except Exception:
+    except Exception as exc:
+        oplog.record_outcome(
+            run_id, status="error", rows_before=rows_before,
+            duration_ms=int((time.time() - started_at) * 1000),
+            error=f"serialize failed: {type(exc).__name__}: {exc}",
+        )
         return _error(_INTERNAL_ERROR, status=500)
+
+    oplog.record_outcome(
+        run_id,
+        status="partial" if failed_step else "ok",
+        rows_before=rows_before,
+        rows_after=row_count,
+        duration_ms=int((time.time() - started_at) * 1000),
+        cached=cache_hit,
+        completed_steps=completed_steps,
+        failed_step=failed_step,
+    )
 
     download_id = _store_result(out_bytes, out_name, media_type)
     inline_b64 = (
@@ -1275,6 +1337,8 @@ def _run_operations(
         {
             "status": "ok",
             "session_id": session_id,
+            "run_id": run_id,  # Track 4 item 5: quote this in a bug report to find the log
+
             "cached": cache_hit,  # Phase 5.8: this result came from the cache (recompute skipped)
             "explanation": " ".join(notes) if notes else "No changes were needed.",
             "notes": notes,
@@ -1335,7 +1399,26 @@ async def execute(
         parsed = json.loads(plan)
     except Exception:
         return _error("That plan couldn't be read — please try running again.", status=400)
+    # NORMALIZE the container before reading anything out of it. A plan may arrive either
+    # wrapped ({"operations": [...]}, what the UI sends) or as a bare list of steps, which
+    # is the natural way to hand-write or script one — and which /marketplace, /workflow
+    # and /sheets already accept. /execute was the odd one out: a list hit `parsed.get`
+    # and raised AttributeError -> 500 "something went wrong on our side", blaming the
+    # server for input the caller can fix. Same class as the malformed-STEP guard below,
+    # one level up — that shape-checks the steps but assumed the container was a dict.
+    # Normalizing here (rather than at each call site) also covers the later
+    # parsed.get("title").
+    if isinstance(parsed, list):
+        parsed = {"operations": parsed}
+    elif not isinstance(parsed, dict):
+        return _error(
+            "That plan isn't in a format I recognise — it should be a list of steps, or "
+            'an object with an "operations" list.',
+            status=400,
+        )
     operations = parsed.get("operations") or []
+    if not isinstance(operations, list):
+        return _error('That plan\'s "operations" should be a list of steps.', status=400)
     if not operations:
         return _error("There's nothing to run.", status=400)
     # Shape-check every step before executing. /process routes Brain output through
