@@ -41,14 +41,16 @@ class ColumnGroup(BaseModel):
 
 
 # One condition inside a filter (e.g. "Revenue greater_than 5000").
+# NOTE (Phase 2.1): every enum below except Operation.action is a plain str, not a
+# Literal. Gemini compiles the response schema into a serving automaton with a hard
+# state limit — the full schema with these as enums gets "constraint has too many
+# states" (400) on EVERY live parse. The prompt documents the allowed values and the
+# trusted Hands validate them with friendly errors, so nothing fails silently.
 class Condition(BaseModel):
     column: str
-    operator: Literal[
-        "equals", "not_equals", "greater_than", "less_than",
-        "greater_or_equal", "less_or_equal", "between",
-        "contains", "starts_with", "ends_with", "is_blank", "not_blank",
-        "in", "not_in",
-    ]
+    operator: str  # equals|not_equals|greater_than|less_than|greater_or_equal|
+    #                less_or_equal|between|contains|starts_with|ends_with|is_blank|
+    #                not_blank|in|not_in
     value: Optional[str] = None
     value2: Optional[str] = None  # only used by "between"
     values: Optional[list[str]] = None  # used by "in" / "not_in" (a set of allowed values)
@@ -62,14 +64,14 @@ class Condition(BaseModel):
 # One KPI on a generated dashboard sheet (its value is computed by trusted code).
 class DashboardKpi(BaseModel):
     label: str
-    agg: Literal["sum", "mean", "count", "count_distinct", "min", "max"]
+    agg: str  # sum | mean | count | count_distinct | min | max
     column: Optional[str] = None  # omit only for a plain row count
-    format: Optional[Literal["number", "currency", "percent"]] = None
+    format: Optional[str] = None  # number | currency | percent
 
 
-# One chart on a generated dashboard sheet.
+# One chart on a generated dashboard sheet. (Bubble size = y_columns[1], not a field.)
 class DashboardChartSpec(BaseModel):
-    chart_type: Literal["bar", "line", "pie", "area"]
+    chart_type: str  # bar|line|area|pie|doughnut|radar|stock|scatter|bubble
     x_column: str
     y_columns: list[str]
     title: Optional[str] = None
@@ -84,6 +86,28 @@ class Operation(BaseModel):
         "unpivot", "pivot", "transpose",
         # Phase 3.5 — Predictive analytics
         "forecast", "what_if", "detect_anomalies",
+        # Phase 1.2 — Conditional formatting
+        "conditional_format",
+        # Phase 1.3 — Split / merge / fill-by-example
+        "split_column", "merge_columns", "fill_by_example",
+        # Phase 1.4 — Sheet layout polish
+        "layout_format",
+        # Phase 1.5 — Data validation / dropdowns
+        "data_validation",
+        # Phase 1.6 — Sheet management
+        "sheet_op",
+        # Phase 1.7 — Native Excel Tables
+        "excel_table",
+        # Phase 1.8 — Goal Seek (inverse what-if)
+        "goal_seek",
+        # Phase 1.9 — Explain changes as cell notes
+        "explain_changes",
+        # Phase 1.10 — Fill series + named ranges
+        "fill_series", "name_range",
+        # Phase 2.1 — Pivot summaries
+        "pivot_summary",
+        # Phase 2.3 — Statistical analysis
+        "statistics",
     ]
     # Which table this operation acts on. Omit to use the current working table.
     table: Optional[str] = None
@@ -91,30 +115,32 @@ class Operation(BaseModel):
     # fill_missing, drop_columns, select_columns.
     columns: Optional[list[str]] = None
     # sort
-    orders: Optional[list[Literal["asc", "desc"]]] = None
+    orders: Optional[list[str]] = None  # asc | desc, one per column
     # add_formula_column
     name: Optional[str] = None
     formula: Optional[str] = None
     overwrite: Optional[bool] = None
     # filter
     conditions: Optional[list[Condition]] = None
-    combine: Optional[Literal["and", "or"]] = None
+    combine: Optional[str] = None  # and | or
     # limit (keep the first/last N rows, e.g. "top 100" after a sort)
     count: Optional[int] = None
     from_end: Optional[bool] = None
     # fill_missing
     fill_value: Optional[str] = None
-    fill_method: Optional[Literal["previous", "next"]] = None
+    fill_method: Optional[str] = None  # previous | next
     # drop_invalid
-    data_type: Optional[Literal["number", "date"]] = None
+    data_type: Optional[str] = None  # number | date
     # lookup
     key_column: Optional[str] = None
     source_sheet: Optional[str] = None
     source_key_column: Optional[str] = None
     return_column: Optional[str] = None
     new_column: Optional[str] = None
-    # aggregate
-    agg_func: Optional[Literal["sum", "mean", "average", "count", "min", "max"]] = None
+    # aggregate. agg_func is a plain str (sum|mean|average|count|min|max) to keep the
+    # Gemini response schema under its serving-size limit — the executor validates it
+    # and answers with a friendly error on anything else.
+    agg_func: Optional[str] = None
     agg_column: Optional[str] = None
     group_by: Optional[list[str]] = None
     count_value: Optional[str] = None
@@ -129,7 +155,7 @@ class Operation(BaseModel):
     rename_to: Optional[list[str]] = None
     # format_cells
     format_columns: Optional[list[str]] = None
-    number_format: Optional[Literal["number", "currency", "percent", "date"]] = None
+    number_format: Optional[str] = None  # number|currency|percent|date|indian_currency
     decimals: Optional[int] = None
     currency_symbol: Optional[str] = None
     date_format: Optional[str] = None
@@ -141,8 +167,11 @@ class Operation(BaseModel):
     sheet_tables: Optional[list[str]] = None
     # Synonym groups: unify differently-named columns that mean the same thing.
     column_groups: Optional[list[ColumnGroup]] = None
-    # chart (add a real Excel chart to the output file)
-    chart_type: Optional[Literal["bar", "line", "pie", "area"]] = None
+    # chart (add a real Excel chart to the output file). NOTE: bubble size is expressed
+    # as y_columns=[y, size] (NOT a dedicated field) — the Operation model is AT Gemini's
+    # structured-output serving limit ("too much branching"), so every optional field
+    # counts; see the schema-serving-cliff note before adding any.
+    chart_type: Optional[str] = None  # bar|line|area|pie|doughnut|radar|stock|scatter|bubble
     x_column: Optional[str] = None
     y_columns: Optional[list[str]] = None
     chart_title: Optional[str] = None
@@ -164,17 +193,112 @@ class Operation(BaseModel):
     header_column: Optional[str] = None
     # forecast (Phase 3.5)
     date_column: Optional[str] = None   # time-axis column; omit to use row index
-    period_unit: Optional[Literal["day", "week", "month", "quarter", "year"]] = None
+    period_unit: Optional[str] = None   # day | week | month | quarter | year
     # forecast periods reuses `count`; forecast value columns reuse `columns`
     # what_if (Phase 3.5) — reuses column, formula, name; scenario columns reuse columns
     # detect_anomalies (Phase 3.5)
-    anomaly_method: Optional[Literal["zscore", "iqr"]] = None
+    anomaly_method: Optional[str] = None  # zscore | iqr
     anomaly_threshold: Optional[float] = None  # z-score threshold or IQR multiplier
+    # conditional_format (Phase 1.2) — value/value2 are the rule bounds; `columns`,
+    # `count` (top/bottom N), and `formula` (formula rules) are reused from above.
+    rule_type: Optional[str] = None
+    value: Optional[float | str] = None
+    value2: Optional[float | str] = None
+    color: Optional[str] = None
+    icons: Optional[int] = None
+    percent: Optional[bool] = None
+    # split_column / merge_columns / fill_by_example (Phase 1.3). `column` is reused
+    # (the source), `columns` (merge sources), `name` (the new/merged column).
+    new_columns: Optional[list[str]] = None
+    delimiter: Optional[str] = None
+    widths: Optional[list[int]] = None
+    pattern: Optional[str] = None
+    separator: Optional[str] = None
+    keep_original: Optional[bool] = None
+    examples: Optional[list["FillExample"]] = None  # fill_by_example input/output pairs
+    # layout_format (Phase 1.4)
+    freeze: Optional[str] = None        # "header" | "first_column" | "both" | "B3"
+    autofit: Optional[bool] = None
+    borders: Optional[str] = None       # all | outline
+    title: Optional[str] = None         # merged title row above the headers
+    merge_range: Optional[str] = None   # e.g. "A10:D10" (blank areas only)
+    header_fill: Optional[str] = None   # named color for the header row
+    # NOTE (Phase 2.7): print/page setup runs via layout_format's `print_setup` free-text
+    # field in the HANDS, but that field is NOT in this schema — adding ANY field here
+    # (even one str) pushes the Operation model over Gemini's serving limit ("too much
+    # branching", 400 on every parse — VERIFIED live). So print setup is available on
+    # DIRECT /execute plans only, until a real schema-headroom refactor lands; the Brain
+    # can't route it yet. Do NOT re-add a field here without a live parse('sort…') check.
+    # data_validation (Phase 1.5) — `columns` and `formula` (custom rules) reused.
+    validation_type: Optional[str] = None  # list|whole|decimal|date|text_length|custom
+    allowed_values: Optional[list[str]] = None
+    min_value: Optional[float | str] = None   # number, or ISO date for date rules
+    max_value: Optional[float | str] = None
+    input_message: Optional[str] = None
+    error_message: Optional[str] = None
+    allow_blank: Optional[bool] = None
+    # sheet_op (Phase 1.6)
+    sheet_action: Optional[str] = None  # new_sheet|rename|delete|copy|move|tab_color|hide|unhide
+    sheet_name: Optional[str] = None   # which sheet (defaults to the working sheet)
+    new_name: Optional[str] = None     # for new_sheet / rename / copy
+    position: Optional[str] = None     # for move: "first", "last", or a number
+    tab_color: Optional[str] = None    # named color for tab_color
+    # excel_table (Phase 1.7)
+    table_style: Optional[str] = None            # blue/green/orange/grey/yellow/dark
+    totals: Optional[bool] = None                # auto totals row (numeric cols summed)
+    totals_spec: Optional[list["TotalSpec"]] = None  # explicit per-column aggregations
+    table_name: Optional[str] = None
+    # goal_seek (Phase 1.8) — `formula` reused, with {var} as the single unknown
+    target: Optional[float] = None
+    variable_name: Optional[str] = None
+    # fill_series / name_range (Phase 1.10) — `name`, `count`, `column` reused
+    series_type: Optional[str] = None  # numbers | months | weekdays | dates
+    start: Optional[float] = None
+    step: Optional[float] = None
+    end: Optional[float] = None
+    start_date: Optional[str] = None   # ISO date for date series
+    every: Optional[str] = None        # daily | weekly | monthly | a weekday name
+    range_name: Optional[str] = None
+    # pivot_summary (Phase 2.1) — group_by (row fields), pivot_column (optional column
+    # field), value_column, and agg_func are reused from above. percent_of/date_bucket
+    # are plain str, NOT Literal: two more enums pushed Gemini's compiled response
+    # schema over its serving limit ("constraint has too many states" 400 on EVERY
+    # live parse). The Hands validate the values with friendly errors anyway.
+    # pivot_summary (Phase 2.1) — group_by (row fields), pivot_column (optional column
+    # field), value_column, and agg_func are reused from above. percent_of/date_bucket
+    # are plain str, NOT Literal: the compiled Gemini response schema sits AT the
+    # serving-size cliff ("constraint has too many states" 400 on every live parse) —
+    # adding enums tips it over. The Hands validate the values with friendly errors.
+    show_totals: Optional[bool] = None
+    percent_of: Optional[str] = None   # grand | row | column
+    date_bucket: Optional[str] = None  # day | week | month | quarter | year
+    live: Optional[bool] = None        # true -> live GROUPBY/PIVOTBY formula (M365)
+    # statistics (Phase 2.3) — reuses columns / x_column / y_columns / value_column /
+    # group_by / count (moving-average window).
+    stat_method: Optional[str] = None  # describe|correlation|regression|moving_average|t_test
+
+
+class TotalSpec(BaseModel):
+    """One totals-row entry for excel_table: which column, and how to total it.
+    (Typed — untyped dicts in the response schema cause decoder loops.)"""
+    column: str
+    agg: str  # sum | average | count | min | max
+
+
+class FillExample(BaseModel):
+    """One fill-by-example pair: the input value the user pointed at, and the output
+    they showed. A TYPED schema keeps the structured-output decoder on rails — an
+    untyped dict here sent it into a repetition loop (21k lines) on live prompts."""
+    input: str
+    output: str
 
 
 class StepSummary(BaseModel):
     label: str                   # "Filter rows where Region equals North"
     rationale: Optional[str] = None  # "Narrows data before aggregating"
+
+
+Operation.model_rebuild()  # resolve the FillExample forward reference
 
 
 class OperationPlan(BaseModel):
@@ -310,13 +434,36 @@ keep the top 100" → [{sort Revenue desc}, {limit count 100}].
    - "columns": which columns to check (omit for all). Use this when the user wants
      to "highlight"/"mark"/"show" blanks rather than fill or remove them.
 
-6. add_formula_column
+6. add_formula_column — the UNIVERSAL FORMULA GENERATOR: any calculation the user \
+describes becomes a live Excel formula + computed preview values.
    - "name": the new column's name
-   - "formula": a per-row expression over existing columns, each column name wrapped in \
-curly braces, e.g. "{Qty} * {Price}". Operators: + - * / ( ). You may also use Excel \
-functions IF, SUM, AVERAGE, MIN, MAX, ROUND, ABS and comparisons (>, <, >=, <=, =, <>), \
-e.g. "IF({Qty} > 10, {Price} * 0.9, {Price})" or "ROUND({A} / {B}, 2)". SUM/AVERAGE here \
-combine the listed columns ROW BY ROW (for a whole-column total use aggregate, not this).
+   - "formula": an Excel-style expression. References: {Col} = that row's cell; \
+{Col:} = the WHOLE column as a range; {Sheet.Col:} = a range on another sheet. \
+Operators: + - * / % ( ) & (text join) and comparisons (>, <, >=, <=, =, <>). \
+String literals in double quotes; TRUE/FALSE allowed.
+   - Functions (pick the simplest that does the job):
+     logic: IF, IFS, IFERROR, SWITCH, AND, OR, NOT
+     math (row by row — for a whole-column totals TABLE use aggregate): SUM, AVERAGE, \
+MIN, MAX, ROUND, ABS, INT, SQRT, MOD, POWER, CEILING, FLOOR
+     conditional aggregates (these take {Col:} ranges): SUMIF, SUMIFS, COUNTIF, \
+COUNTIFS, AVERAGEIF, AVERAGEIFS, MAXIFS, MINIFS — criteria like ">10", "<>0", "North", \
+"wid*", or a row ref: COUNTIF({Region:}, {Region}) counts each row's own region
+     text: UPPER, LOWER, PROPER, TRIM, LEN, LEFT, RIGHT, MID, SUBSTITUTE, CONCAT, \
+TEXTJOIN, REGEXEXTRACT, REGEXREPLACE, REGEXTEST
+     dates: TODAY, YEAR, MONTH, DAY, WEEKDAY, DATE, EOMONTH, DATEDIF, NETWORKDAYS
+     lookup/rank: XLOOKUP(value, {LookupCol:}, {ReturnCol:}, [if_not_found]), \
+INDEX({Col:}, MATCH(value, {Col:})), RANK(value, {Col:}), LARGE({Col:}, k), SMALL({Col:}, k)
+     financial: PMT(rate, nper, pv), NPV(rate, {CashFlow:}), IRR({CashFlow:})
+     dynamic arrays (spill): UNIQUE({Col:}), SORT({Col:}), FILTER({Col:}, condition), SEQUENCE(n)
+   - Examples: IFS({Qty}>20, "High", {Qty}>5, "Mid", TRUE, "Low") · \
+XLOOKUP({Product}, {Prices.Product:}, {Prices.Unit_Price:}, 0) · \
+SUMIF({Region:}, {Region}, {Price:}) · {Name} & " - " & UPPER({Region}) · \
+NETWORKDAYS({Start}, {End}) · RANK({Price}, {Price:})
+   - Do NOT generate GROUPBY/PIVOTBY as formula text (use the pivot_summary operation — \
+it computes the grid, or writes the live formula itself when the user wants one), \
+TEXTSPLIT (ask which part, or split the column), or VLOOKUP (use XLOOKUP / \
+INDEX+MATCH). The engine adds Microsoft-365 version warnings automatically — you \
+don't need to.
    - If the new column name ALREADY EXISTS, ask the user whether to overwrite it or use a \
 new name (clarification). Only set "overwrite": true if they confirm overwriting.
 
@@ -346,7 +493,10 @@ new name (clarification). Only set "overwrite": true if they confirm overwriting
 12. select_columns — "columns": the only columns to keep
 
 13. format_cells — change how values look (does not change the data)
-   - "format_columns": columns to format, "number_format": number/currency/percent/date,
+   - "format_columns": columns to format, "number_format": number/currency/percent/date/\
+indian_currency. IMPORTANT: if the user says lakh, crore, "Indian style/format", or \
+shows grouping like 12,34,567 — the format is "indian_currency", NEVER plain "currency" \
+(that one gives western 1,234,567 grouping),
      optional "decimals", "currency_symbol", and "bold_header" (true to bold the header row).
    - "date_format": with number_format "date", the desired style, e.g. "dd-mm-yyyy"
      (default), "yyyy-mm-dd", "mm/dd/yyyy", or "dd-mmm-yyyy" (09-Jun-2026).
@@ -374,16 +524,25 @@ new name (clarification). Only set "overwrite": true if they confirm overwriting
    - "new_table": optional name for the output file (defaults to "combined")
 
 16. chart — add a REAL chart to the output file (it does NOT change the data). Use for
-    "make/draw/plot a chart/graph" requests, e.g. "bar chart of revenue by month". Pick
-    the type that fits: bar = compare categories/rankings; line = a trend over time;
-    pie = share of a whole (one value column); area = cumulative trend.
-   - "chart_type": bar, line, pie, or area
-   - "x_column": the label/category column (x-axis), e.g. Month
-   - "y_columns": one or more NUMERIC value columns to plot (y-axis), e.g. Revenue
+    "make/draw/plot a chart/graph" requests, e.g. "bar chart of revenue by month".
+   - "chart_type": bar, line, area, pie, doughnut, radar, stock (these use category
+     labels on the x-axis) OR scatter, bubble (these need a NUMERIC x-axis). Pick what
+     fits: bar = compare categories; line = trend over time; area = cumulative trend;
+     pie/doughnut = share of a whole (one value column); radar = compare several metrics;
+     stock = high/low/close price series; scatter = relationship between two numbers;
+     bubble = scatter with a third number as the dot size. Default bar if unsure.
+   - "x_column": the x-axis column (category labels, or the numeric x for scatter/bubble)
+   - "y_columns": one or more NUMERIC value columns (y-axis). For stock, list the price
+     columns (e.g. High, Low, Close). For a BUBBLE chart, give two: [y, size] — the
+     second column sets each bubble's size.
    - "chart_title": optional title
     If the file has MANY rows per category (e.g. "revenue by month" but several rows per
     month), aggregate FIRST then chart — output an aggregate step, then a chart step.
-    Only bar/line/pie/area are supported; for any other chart type, decline via "reply".
+    Chart types Excel files can't hold (histogram, waterfall, funnel, treemap, sunburst,
+    sparkline, gauge, heatmap, map) are NOT supported: the engine will suggest the
+    nearest one, so just pass the chart_type the user asked for and let it respond — or,
+    if you already know the equivalent (histogram→bar of bins, heatmap→conditional
+    formatting), offer that instead.
 
 17. dashboard — assemble a one-page DASHBOARD (KPIs + charts + a short written summary)
     onto a new sheet. Use for "make a dashboard", "one-page summary", "how's the shop
@@ -392,11 +551,14 @@ new name (clarification). Only set "overwrite": true if they confirm overwriting
    - "kpis": a list of headline metrics, each {"label": e.g. "Total Revenue", "agg":
      sum/mean/count/count_distinct/min/max, "column": the column (omit only for a plain
      count), "format": currency/percent/number}
-   - "charts": a list, each {"chart_type": bar/line/pie/area, "x_column", "y_columns":
-     [numeric column(s)], "title"}
-   - "summary": a short (1-3 sentence) plain-language summary of the data
-    If a chart needs aggregated data (e.g. revenue by month from many rows), add an
-    aggregate step BEFORE the dashboard so the chart's columns exist.
+   - "charts": a list, each {"chart_type": any chart type from operation 16
+     (bar/line/area/pie/doughnut/radar/stock/scatter/bubble), "x_column", "y_columns":
+     [numeric column(s)], "size_column" (bubble only), "title"}
+   - "summary": OPTIONAL short qualitative note. You do NOT need to put numbers in it —
+     the engine writes the accurate figures itself from the computed KPIs, so never
+     invent totals/averages here; a one-line qualitative observation is enough.
+    If a chart or KPI needs aggregated data (e.g. revenue by month from many rows), add
+    an aggregate step BEFORE the dashboard so the columns exist.
 
 18. unpivot — turn WIDE data into tidy LONG rows (e.g. monthly columns Jan/Feb/Mar →
     rows with a Month column + a value column). Use for "unpivot", "melt", "columns to
@@ -407,9 +569,9 @@ new name (clarification). Only set "overwrite": true if they confirm overwriting
    - "var_name": name for the new column holding the old column names (e.g. Month)
    - "value_name": name for the new values column (e.g. Sales)
 
-19. pivot — summarize LONG data into a WIDE grid (e.g. rows of Region/Month/Sales → a
-    Region × Month grid of summed Sales). Use for "pivot", "pivot table", "rows to
-    columns", "summary grid".
+19. pivot — plain long→wide RESHAPE (no totals, no percentages, no date grouping).
+    PREFER pivot_summary (section 36) whenever the user says "pivot table" or asks for
+    a summary — use this one only for a bare rows-to-columns reshape.
    - "index_columns": the row groups (e.g. Region)
    - "pivot_column": the column whose values become new columns (e.g. Month)
    - "value_column": the column to aggregate (e.g. Sales)
@@ -452,9 +614,230 @@ new name (clarification). Only set "overwrite": true if they confirm overwriting
    columns. Rows that are perfectly normal show False / blank.
    NEVER use this for less than 5 rows — decline via "reply" if the data is too small.
 
+24. conditional_format — LIVE Excel highlighting rules (the data itself is unchanged;
+   the rules keep working as the user edits the file). Use this whenever the user says
+   highlight/color/flag/mark cells by a condition.
+   - "columns": which column(s) the rule applies to
+   - "rule_type": one of greater_than, less_than, between, equal_to, not_equal,
+     text_contains, date_before, date_after, blanks, duplicates, unique, top_n,
+     bottom_n, color_scale, data_bars, icon_set, formula
+   - "value" (+ "value2" for between): the bound(s); ISO date for date rules
+   - "count": N for top_n/bottom_n (with "percent": true for percentages)
+   - "color": green, red, yellow, orange, blue, purple, or grey (optional — sensible
+     defaults: red for duplicates, yellow for blanks, green otherwise)
+   - "icons": 3, 4, or 5 for icon_set
+   - "formula": for formula rules, the Phase-1.1 grammar ({Col} = that row's cell),
+     e.g. "{Total} > 2 * {Price}"
+   Examples: "highlight Price above 50000 in green" → rule_type greater_than,
+   value 50000, color green · "flag duplicate emails in red" → duplicates, red ·
+   "color scale the Score column" → color_scale · "3-icon set on Rating" → icon_set,
+   icons 3 · "mark blank Qty cells" → blanks.
+
+25. split_column — split ONE column into several (Text-to-Columns).
+   - "column": the source; "new_columns": names for the parts (e.g. ["First", "Last"])
+   - one of: "delimiter" (e.g. " " or ","), "widths" ([3, 5] fixed-width), or
+     "pattern" (a regex whose CAPTURE GROUPS become the new columns)
+   - "keep_original": false to drop the source column (default keeps it)
+   - Omit the delimiter only if it's obvious — the engine infers common ones and asks
+     when it can't tell. Example: "split Full Name into First and Last" →
+     column "Full Name", new_columns ["First", "Last"], delimiter " ".
+
+26. merge_columns — join several columns into one.
+   - "columns": the sources in order; "name": the new column; "separator" (default ", ")
+   - "keep_original": false to drop the sources (default keeps them, and the saved file
+     then gets a live TEXTJOIN formula). Blank parts are skipped automatically.
+   Example: "combine City and State with a comma" → columns ["City", "State"],
+   name "City_State", separator ", ".
+
+27. fill_by_example — the user SHOWS the wanted result for one or two rows and the
+   engine infers the transform (Flash Fill). USE THIS whenever the user gives
+   input→output example(s) instead of naming an operation.
+   - "column": the source; "name": the new column
+   - "examples": [{"input": "Asha Sharma", "output": "asha.sharma"}, ...] — copy the
+     user's examples EXACTLY; the trusted engine induces the pattern and REFUSES if
+     the examples conflict (never invent extra examples yourself).
+   Example: "make usernames like asha.sharma from the Name column" → column "Name",
+   name "Username", examples [{"input": <a real Name value from the sample rows>,
+   "output": <what the user showed>}].
+
+28. layout_format — sheet LAYOUT polish (freeze/widths/borders/title). All fields
+   optional; set only what the user asked for:
+   - "freeze": "header" (keep the header row visible), "first_column", "both", or a
+     cell like "B3" for a custom split
+   - "autofit": true — fit column widths to the content
+   - "borders": "all" (a grid on the used range) or "outline" (a box around it)
+   - "title": text for a merged, centered heading ABOVE the data (a new top row —
+     use this whenever the user wants a title/heading over the sheet). "Merge the top
+     row / merge A1:D1 for a title" means THIS field — never the `merge` op, which
+     combines whole TABLES side by side.
+   - "merge_range": merge a range like "A10:D10" (only over blank cells; for a
+     heading over the data always prefer "title")
+   - "header_fill": a named color (green/red/yellow/orange/blue/purple/grey) to tint
+     the header row (it also becomes bold)
+   Examples: "freeze the header row" → freeze "header" · "autofit all columns" →
+   autofit true · "add borders to the table" → borders "all" · "merge A1:D1 for a
+   title saying Q1 Sales" → title "Q1 Sales" · "make the header row blue" →
+   header_fill "blue". For NUMBER formatting (currency, dates, lakh/crore commas)
+   use format_cells, not this.
+
+29. data_validation — restrict what can be TYPED into a column (a real Excel rule in
+   the saved file; existing data is unchanged and the note counts current violations).
+   - "columns": where the rule applies
+   - "validation_type": "list" (dropdown), "whole", "decimal", "date", "text_length",
+     or "custom"
+   - "allowed_values": the dropdown options. OMIT to build the dropdown from the
+     column's own distinct values ("add a dropdown of Regions" → just name the column).
+   - "min_value"/"max_value": bounds for whole/decimal/text_length, ISO dates for date
+     rules ("only 2026 dates" → min "2026-01-01", max "2026-12-31")
+   - "formula": for custom rules, the {Col} grammar (e.g. {Qty} * {Price} < 100000)
+   - "input_message"/"error_message": optional hint shown on select / on bad entry
+   Examples: "add a dropdown of Regions to the Region column" → list, columns
+   ["Region"] (no allowed_values) · "restrict Qty to 1-1000" → whole, min 1, max 1000 ·
+   "only allow 2026 dates in Date" → date, min "2026-01-01", max "2026-12-31".
+
+30. sheet_op — manage the workbook's SHEETS/TABS (create, rename, delete, copy, move,
+   tab colors, hide/unhide, protect/unprotect). After a sheet_op the whole workbook is
+   saved, every tab included.
+   - "sheet_action": new_sheet | rename | delete | copy | move | tab_color | hide |
+     unhide | protect | unprotect | protect_workbook | unprotect_workbook
+   - "sheet_name": which sheet (omit for the current working sheet)
+   - "new_name": for new_sheet ("put the summary in a new tab called Report" — run the
+     summary steps first, then sheet_op new_sheet with new_name "Report"), rename, copy
+   - "position": for move — "first", "last", or a 1-based number
+   - "tab_color": green/red/yellow/orange/blue/purple/grey
+   - protect = lock the sheet's cells so they resist accidental edits; add "columns" to
+     leave those specific columns editable. protect_workbook = lock the workbook so
+     sheets can't be added/removed/reordered. unprotect / unprotect_workbook reverse them.
+   - compare = DIFF two files/sheets ("what changed between these two files?"): set
+     "sheet_name" to the first table and "source_sheet" to the second; add "key_column"
+     to match rows by a key (e.g. ID) instead of by position. Produces a Comparison table
+     of the added/removed columns & rows and the changed cells. If only two files are
+     uploaded you can omit the names.
+   PASSWORDS: Sumio protection is PASSWORD-LESS by design. If the user asks to protect or
+   encrypt WITH A PASSWORD, still use sheet_op protect (structural), and do NOT put the
+   password anywhere in the plan — the engine notes that setting an open/file password is
+   user-driven (they do it in Excel). NEVER echo or store a password.
+   Examples: "rename Sheet1 to Raw" → rename, sheet_name "Sheet1", new_name "Raw" ·
+   "color the Totals tab green" → tab_color, sheet_name "Totals", tab_color "green" ·
+   "hide the Prices sheet" → hide, sheet_name "Prices" · "protect this sheet but let me
+   edit Qty" → protect, columns ["Qty"] · "lock the workbook structure" → protect_workbook
+   · "what changed between the two files, matched on ID" → compare, sheet_name "fileA",
+   source_sheet "fileB", key_column "ID".
+
+31. excel_table — format the data as a NATIVE Excel Table: banded rows, header filter
+   buttons, and an optional live totals row. Use whenever the user says "format as a
+   table", "make this a table", "add filters", or asks for a totals row.
+   - "table_style": blue (default), green, orange, grey, yellow, dark
+   - "totals": true — numeric columns get live SUM subtotals, the first text column
+     shows "Total"
+   - "totals_spec": explicit control, e.g. [{"column": "Qty", "agg": "average"}]
+     (aggs: sum, average, count, min, max)
+   - "table_name": optional (letters/numbers/underscores)
+   Examples: "format this as a table with totals" → totals true · "make a blue table
+   of the sales data" → table_style "blue".
+
+32. goal_seek — INVERSE what-if: find the ONE input value that makes a formula hit a
+   target ("what price gives 1,000,000 revenue at current volume?").
+   - "formula": the Phase-1.1 grammar with {var} as the unknown —
+     "{var} * SUM({Qty:})" (a row-wise formula is summed automatically)
+   - "target": the number to reach
+   - "variable_name": what the unknown IS, for the explanation (e.g. "price")
+   STRICTLY ONE unknown: if the user wants to solve for two things at once, ask which
+   one to solve for (clarification) — never guess. The engine reports the found value
+   and writes the working to a 'Goal Seek' sheet; the data itself is unchanged.
+   Example: "what price gives 10 lakh revenue at current volume" → formula
+   "{var} * SUM({Qty:})", target 1000000, variable_name "price".
+
+33. explain_changes — attach explanatory CELL NOTES for what the plan changed (no
+   fields). Put it as the LAST operation whenever the user says "explain your changes
+   as notes/comments", "annotate what you changed", "mark the changes". Changed cells
+   get hover notes ("was blank → 0"); added columns get a header note; if rows were
+   added/removed, a summary note goes on A1 instead of per-cell notes (rows shift, so
+   per-cell notes could land wrong — the engine handles this automatically). The data
+   itself is never altered.
+   Example: "fill the blanks with 0 and explain your changes as cell notes" →
+   [fill_missing …, explain_changes].
+
+34. fill_series — generate a sequence. If it fits the table's row count it becomes a
+   new COLUMN ("number the rows"); a standalone length goes on its own new sheet.
+   - "series_type": numbers | months | weekdays | dates
+   - numbers: "start" (default 1), "step" (default 1), and "end" or "count"
+   - months/weekdays: "count" (defaults 12 / 7)
+   - dates: "start_date" (ISO), "every" (daily/weekly/monthly or a weekday like
+     "monday"), "count"
+   - "name": the column/sheet name
+   Examples: "number the rows 1-100" → numbers, start 1, end 100, name "No." ·
+   "list the 12 months" → months, name "Month" · "dates every Monday from July" →
+   dates, every "monday", start_date "2026-07-01", count 10.
+
+35. name_range — give a column's data range a NAME ("name B2:B500 as Prices"): the
+   saved file gets the Excel defined name, and later formulas IN THIS SAME plan can
+   use {TheName:} like a column.
+   - "range_name": letters/numbers/underscores, starting with a letter
+   - "column": which column's data range to name
+   Example: "name the Price column 'Prices' and add a column with each price's share
+   of the total" → [name_range range_name "Prices" column "Price",
+   add_formula_column name "Share" formula "{Price} / SUM({Prices:})"].
+
+36. pivot_summary — a PIVOT TABLE: a grouped summary grid. Use for "pivot table",
+   "summary by X (and Y)", "cross-tab", "% of total by …", "monthly/quarterly totals".
+   - "group_by": the ROW field(s), e.g. ["Region"]
+   - "pivot_column": optional COLUMN field for a 2-D grid (e.g. "Product") — omit for
+     a simple 1-D summary
+   - "value_column": the column to summarize. Whenever the user names a measure —
+     "total Qty", "sum of Price", "average Amount" — set value_column to THAT column
+     (e.g. "total Qty by month" → value_column "Qty"). Only omit it for a pure count.
+   - "agg_func": sum (default), average, count, min, max. count works without a
+     value_column (row counts).
+   - "show_totals": totals row/column (default true; set false for "no totals")
+   - "percent_of": "grand" | "row" | "column" — show each cell as % of that total
+     (only with sum/count)
+   - "date_bucket": day | week | month | quarter | year — set it whenever the user
+     says monthly/quarterly/yearly etc. and a date column is a row/column field
+     (dates stored as text are handled)
+   - "live": true ONLY if the user explicitly wants a live/dynamic GROUPBY/PIVOTBY
+     formula that recalculates in Excel — it needs Microsoft 365 and the engine warns.
+     Default (omit) writes computed values that work everywhere.
+   If the user asks for a NATIVE interactive PivotTable object (drag-and-drop field
+   list, slicers), explain in "reply" that Sumio builds computed pivot summaries and
+   live GROUPBY/PIVOTBY formulas instead — it cannot create the interactive object.
+   Examples: "pivot table of total Price by Region and Product" → group_by ["Region"],
+   pivot_column "Product", value_column "Price", agg_func "sum" · "monthly Qty totals"
+   → group_by ["Date"], value_column "Qty", date_bucket "month" · "share of revenue
+   by region" → group_by ["Region"], value_column "Price", percent_of "grand".
+
+37. statistics — STATISTICAL ANALYSIS. Set "stat_method" to EXACTLY one of these five
+   words (no other value): describe, correlation, regression, moving_average, t_test.
+   Put the column(s) the user names into "columns" when they name any. Methods:
+   - describe: summary stats (count/mean/median/std/min/quartiles/max). columns = the
+     columns to summarize (omit to describe all numeric columns).
+   - correlation: Pearson correlation + the strongest pair in words. columns = the columns
+     to correlate (omit for all numeric).
+   - regression: linear regression, one predictor -> one outcome. columns = [predictor,
+     outcome]. In "regress Y on X" / "regression of Y on X", the predictor is X (the
+     column after "on") and the outcome is Y, so columns = ["X", "Y"].
+   - moving_average: add a rolling-average column. columns = [the column to smooth];
+     count = the window (e.g. 3).
+   - t_test: compare two groups' means (Welch). columns = the two numeric columns to
+     compare, OR value_column + group_by = a column that splits rows into two groups.
+   Every result includes a plain-language interpretation; the engine declines honestly on
+   too-little data, so it's fine to output the operation even if you're unsure of a column.
+   Examples: "summary statistics for Qty and Price" -> describe, columns ["Qty","Price"] ·
+   "correlation between Qty and Price" -> correlation, columns ["Qty","Price"] ·
+   "regress Sales on Price" -> regression, columns ["Price","Sales"] (predictor first) ·
+   "3-month moving average of Revenue" -> moving_average, columns ["Revenue"], count 3 ·
+   "compare Qty for North vs South" -> t_test, value_column "Qty", group_by ["Region"].
+
 Rules:
 - Use the EXACT column and table names given in the structure. Match the user's intent \
 to real columns/tables even if they describe them loosely.
+- For the STATISTICS operation, put the column names the user mentions into "columns" \
+(regression = [predictor, outcome]; moving_average = [the column]; t_test = two columns \
+or value_column+group_by). Still emit the operation even if unsure — the engine asks for \
+any missing columns rather than failing.
+- Plans are SHORT: almost never more than 8 operations. NEVER emit near-identical \
+operations repeatedly. For fill_by_example, include ONLY the example pair(s) the user \
+actually gave — never one per row.
 - You may output multiple operations; they run in order. If the user gives SEVERAL \
 instructions at once — on separate lines, numbered (1. 2. 3.), or joined by "then"/"and" \
 (e.g. "Filter Amount > 500 / Sort Amount descending / Create Tax column") — output ONE \
@@ -467,12 +850,26 @@ resort when you genuinely cannot tell which column/table/value is meant.
 pick a sensible default): set "clarification" to ONE short question (in the user's \
 language) and leave "operations" empty. Do NOT ask about things you can reasonably \
 infer (e.g. that two different-column files should be merged side by side).
-- UNSUPPORTED request (something outside the operations above, e.g. predict/forecast \
-sales, send an email): do NOT clarify and do NOT invent a \
-result. Put a friendly explanation in the "reply" field, like: "I can't do that yet — \
-but I can sort, filter, remove duplicates, add formula columns, look up, aggregate, \
-find & replace, rename/drop columns, merge, combine sheets, chart, build a dashboard, \
-or reshape (pivot/unpivot/transpose)." Leave "operations" empty.
+- TIE between columns — you MUST ask, and this is NOT a "last resort" case: when the \
+user's word matches SEVERAL columns equally well (e.g. "sort by price" when the sheet \
+has Price_2024 AND Price_2025, or "amount" with Amount and Amount.1), picking one is a \
+coin flip, and a wrong guess delivered confidently is worse than a question. Set \
+"clarification" naming the tied columns ("Which one — Price_2024 or Price_2025?") and \
+leave "operations" empty. Only infer when ONE column is the clear best match.
+- UNSUPPORTED request (something outside the operations above, e.g. send an email, run a \
+macro, or an Excel feature this engine can't create such as SPARKLINES, native \
+PivotTable objects, treemap/sunburst/waterfall/funnel/map charts): do NOT clarify and do \
+NOT invent a result. Put a friendly explanation in the "reply" field, like: "I can't do \
+that yet — but I can sort, filter, remove duplicates, add formula columns, look up, \
+aggregate, find & replace, rename/drop columns, merge, combine sheets, chart, build a \
+dashboard, or reshape (pivot/unpivot/transpose)." Leave "operations" empty. \
+(Forecasting, what-if and anomaly detection ARE supported — do not decline those.)
+- NEVER SILENTLY SUBSTITUTE a near-equivalent. If you cannot do exactly what was asked \
+but something close IS possible (e.g. sparklines -> in-cell data bars, a treemap -> a \
+bar chart), do NOT just run the substitute as if it were the request. Name the gap and \
+offer the alternative in "reply", leaving "operations" empty — e.g. "I can't add \
+sparklines, but I can put data bars in those cells instead — want me to?" The user must \
+get what they asked for, or be told plainly why they can't.
 - NON-EXISTENT column/table: if the user names a column or table that isn't in the \
 structure (even loosely), do NOT invent it. Ask in "clarification" and list the real \
 column/table names so they can pick (e.g. "I don't see a 'Profit' column — did you mean \
@@ -490,6 +887,14 @@ put a direct answer in the "reply" field and leave "operations"/"clarification" 
 When there are MULTIPLE tables, answer for EVERY table, grouped by table name. \
 Example: "Testing 1: Name, Roll No.  •  testing: product, Quantity". If the user names \
 a specific table, answer just that one.
+- INSIGHTS / ANALYSIS requests ("what stands out?", "any insights?", "analyze this", \
+"key findings", "what's interesting", "summarize the trends"): NEVER invent specific \
+numbers, totals, percentages, or trends in "reply" — you don't have the actual figures, \
+so any number you write would be fabricated. Instead OUTPUT A COMPUTING OPERATION that \
+produces the real figures: an aggregate (totals/averages by a category), a statistics \
+describe/correlation, or a pivot_summary — the engine computes the numbers and attaches \
+a verified one-line insight automatically. Only if no such operation fits should you \
+reply, and then keep it QUALITATIVE (no invented figures).
 - CONVERSATION CONTEXT: you may be given "Recent conversation". A new instruction can \
 be a fragment that DEPENDS on a previous one — combine them to get the full intent. \
 E.g. previous "name the columns", new "in the testing table" → answer the columns of \
@@ -559,15 +964,34 @@ def parse_instruction(instruction: str, structure: dict, history: str = "") -> d
         temperature=0,
         response_mime_type="application/json",
         response_schema=OperationPlan,
+        # A plan is small. Without a ceiling, a decoder repetition-loop can burn MINUTES
+        # emitting thousands of half-repeated operations before dying on truncated JSON
+        # (seen live: 21k lines / 239s on a fill-by-example prompt). Cap it so degenerate
+        # generations fail in seconds instead.
+        max_output_tokens=4096,
     )
-    response = _generate_with_retry(user_content, gen_config)
 
-    # `response.parsed` is an OperationPlan instance when the schema is honored;
-    # fall back to parsing the raw JSON text if needed.
-    plan = response.parsed
-    if isinstance(plan, OperationPlan):
-        return plan.model_dump()
-    return OperationPlan.model_validate_json(response.text).model_dump()
+    for attempt in range(2):  # one retry: a fresh sample usually escapes a decode loop
+        response = _generate_with_retry(user_content, gen_config)
+        # `response.parsed` is an OperationPlan instance when the schema is honored;
+        # fall back to parsing the raw JSON text if needed.
+        plan = response.parsed
+        if isinstance(plan, OperationPlan):
+            return plan.model_dump()
+        try:
+            return OperationPlan.model_validate_json(response.text).model_dump()
+        except Exception:
+            if attempt == 0:
+                continue
+    # Truncated/degenerate output twice: answer honestly through the normal message
+    # path (this is a model hiccup, not an infrastructure outage — don't blame either).
+    return {
+        "operations": [],
+        "reply": (
+            "I had trouble writing that plan down cleanly — could you rephrase the "
+            "request, or split it into smaller steps?"
+        ),
+    }
 
 
 DASHBOARD_SYSTEM_PROMPT = """\

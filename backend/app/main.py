@@ -10,6 +10,7 @@ Flow for POST /process:
 from __future__ import annotations
 
 import base64
+import difflib
 import hashlib
 import io
 import json
@@ -27,19 +28,34 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from openpyxl import Workbook
-from openpyxl.chart import AreaChart, BarChart, LineChart, PieChart, Reference
+from openpyxl.chart import (
+    AreaChart, BarChart, BubbleChart, DoughnutChart, LineChart, PieChart,
+    RadarChart, Reference, ScatterChart, Series, StockChart,
+)
+from openpyxl.chart.marker import Marker
+from openpyxl.formatting.rule import (
+    CellIsRule,
+    ColorScaleRule,
+    DataBarRule,
+    FormulaRule,
+    IconSetRule,
+    Rule,
+)
 from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.styles.differential import DifferentialStyle
 from openpyxl.utils import get_column_letter
 
 # Matches {ColumnName} placeholders inside a formula template.
 _PLACEHOLDER = re.compile(r"\{([^{}]+)\}")
 
 from . import (
-    auth, collab, config, connectors, digest, distribution, exports, fallback, guardrails,
-    llm, oidc, org, personalization, pii, quality, slack, store, sync,
+    apikeys, audit, auth, collab, compliance, config, connectors, digest, distribution,
+    execsummary, exports, fallback, guardrails, kg, lineage, llm, marketplace, oidc, org,
+    permissions, personalization, pii, quality, scale, selfheal, slack, solver, store, sync,
+    voice, workflow,
 )
 from .db import init_db, session_scope
-from .executor import MultiStepError, OperationError, execute_multi
+from .executor import MultiStepError, OperationError, execute_multi, _resolve_sheet_name
 from .operations.base import to_datetime as _to_datetime
 from .reader import load_files, summarize_structure, summarize_tables
 
@@ -668,6 +684,7 @@ async def undo(session_id: str = Form(...)) -> JSONResponse:
         "steps_remaining": len(states) - 1,  # not counting the original upload
         "row_count": biggest,
         "primary": cur["primary"],
+        "label": cur.get("label", "Uploaded"),  # where we landed (Phase 3.2)
         "can_undo": len(states) > 1,
         "can_redo": True,  # we just put one step on the redo stack
     })
@@ -689,8 +706,74 @@ async def redo(session_id: str = Form(...)) -> JSONResponse:
         "steps_remaining": len(entry["states"]) - 1,
         "row_count": biggest,
         "primary": cur["primary"],
+        "label": cur.get("label", "Uploaded"),  # where we landed (Phase 3.2)
         "can_undo": True,  # we just appended a step
         "can_redo": len(redo_stack) > 0,
+    })
+
+
+@app.post("/history")
+async def history(session_id: str = Form(...)) -> JSONResponse:
+    """Phase 3.2 — the LABELED version history: every step so far, what it did, and how
+    many rows it left, with the current version marked. Powers a restore/redo timeline."""
+    entry = _SESSIONS.get(session_id)
+    if not entry:
+        return _error("No history yet — upload a file to start.", status=400)
+    states = entry["states"]
+    versions = [
+        {
+            "index": i,
+            "label": st.get("label", "Uploaded" if i == 0 else "Changed the data"),
+            "row_count": max((len(t) for t in st["tables"].values()), default=0),
+            "current": i == len(states) - 1,
+        }
+        for i, st in enumerate(states)
+    ]
+    return JSONResponse({
+        "status": "ok",
+        "versions": versions,
+        "current_index": len(states) - 1,
+        "can_undo": len(states) > 1,
+        "can_redo": len(entry.get("redo") or []) > 0,
+    })
+
+
+@app.post("/compare-versions")
+async def compare_versions(
+    session_id: str = Form(...),
+    from_index: int = Form(0),
+    to_index: int = Form(-1),
+) -> JSONResponse:
+    """Phase 3.2 (ties to 2.9) — what changed BETWEEN two versions of this session's data.
+    Defaults to the original upload (0) vs the current version (-1). Diffs the working
+    table via the trusted compare engine, so every reported change is real."""
+    from .operations.compare import compare_tables
+
+    entry = _SESSIONS.get(session_id)
+    states = entry["states"] if entry else []
+    if not states:
+        return _error("No history to compare — upload a file first.", status=400)
+    n = len(states)
+    fi = from_index if from_index >= 0 else n + from_index
+    ti = to_index if to_index >= 0 else n + to_index
+    if not (0 <= fi < n) or not (0 <= ti < n):
+        return _error(f"This session has {n} version(s) (0…{n - 1}) — pick two of them.", status=400)
+    if fi == ti:
+        return _error("Those are the same version — pick two different ones.", status=400)
+    a, b = states[fi], states[ti]
+    try:
+        diff, note = compare_tables(
+            a["tables"][a["primary"]], b["tables"][b["primary"]],
+            a.get("label", f"version {fi}"), b.get("label", f"version {ti}"),
+        )
+    except Exception:
+        return _error(_INTERNAL_ERROR, status=500)
+    return JSONResponse({
+        "status": "ok",
+        "from": {"index": fi, "label": a.get("label", f"version {fi}")},
+        "to": {"index": ti, "label": b.get("label", f"version {ti}")},
+        "note": note,
+        "differences": diff.to_dict("records"),
     })
 
 
@@ -795,6 +878,105 @@ def _describe_op(op: dict) -> str:
     return (a or "operation").replace("_", " ")
 
 
+# Op keys that REFERENCE existing columns (validated by _missing_columns). Keys that
+# CREATE columns ("name", "new_column") are deliberately absent — those may be anything.
+_COLUMN_REF_KEYS = (
+    "column", "columns", "group_by", "agg_column",
+    "key_column", "source_key_column", "return_column", "value_column",
+    "pivot_column", "index_columns",
+)
+
+
+def _missing_columns(operations: list[dict], tables: dict) -> list[str]:
+    """PRD 1.3 / Definition-of-Done plan validation: every column an operation READS
+    must exist somewhere in the workbook. Checked case-insensitively (space-trimmed)
+    against the UNION of all sheets' columns, so cross-sheet ops (lookup) never
+    false-positive. Returns referenced names found in NO sheet — a Brain planning on a
+    phantom column is exactly the confident-but-wrong failure the PRD forbids, and
+    weaker models do it even where stronger ones correctly ask."""
+    known = {str(c).strip().lower() for df in tables.values() for c in df.columns}
+    # Names the PLAN ITSELF creates (a formula column added in step 1 may be sorted in
+    # step 2; a named range declared early is used later) count as known — otherwise a
+    # perfectly good chained plan gets a spurious clarify.
+    for op in operations:
+        for key in ("name", "new_column", "new_name", "range_name"):
+            v = op.get(key)
+            if isinstance(v, str) and v.strip():
+                known.add(v.strip().lower())
+        for key in ("new_columns", "rename_to"):
+            for v in op.get(key) or []:
+                if isinstance(v, str) and v.strip():
+                    known.add(v.strip().lower())
+    known_list = sorted({str(c).strip() for df in tables.values() for c in df.columns})
+    missing: list[str] = []
+
+    def flag(name: str) -> None:
+        if name not in missing:
+            missing.append(name)
+
+    for op in operations:
+        for key in _COLUMN_REF_KEYS:
+            val = op.get(key)
+            names = val if isinstance(val, list) else [val] if val else []
+            for name in names:
+                if not isinstance(name, str) or not name.strip():
+                    continue
+                if name.strip().lower() not in known:
+                    flag(name)
+        # Phase-1.1 formula templates: {Col} / {Col:} / {Sheet.Col:}. Only flag refs the
+        # executor's self-correction could NOT repair (no close match anywhere) — typos
+        # with an obvious fix are auto-repaired downstream, and that's a feature.
+        for inner in re.findall(r"\{([^{}]+)\}", op.get("formula") or ""):
+            text = inner.strip()
+            if text.lower() == "var":  # Goal Seek's reserved unknown, not a column
+                continue
+            is_range = text.endswith(":")
+            if is_range:
+                text = text[:-1].strip()
+            if is_range and "." in text:
+                sheet, col = (p.strip() for p in text.split(".", 1))
+                sheet_df = next((d for n, d in tables.items() if n == sheet), None)
+                if sheet_df is None or col not in {str(c).strip() for c in sheet_df.columns}:
+                    flag(f"{sheet}.{col}")
+                continue
+            if text.strip().lower() in known:
+                continue
+            if not difflib.get_close_matches(text, known_list, n=1, cutoff=0.6):
+                flag(text)
+    return missing
+
+
+def _missing_columns_clarification(missing: list[str], tables: dict) -> str:
+    """A helpful clarify message: name what wasn't found, suggest the nearest match."""
+    all_cols = sorted({str(c).strip() for df in tables.values() for c in df.columns})
+    parts = []
+    for name in missing[:3]:
+        close = difflib.get_close_matches(name, all_cols, n=1, cutoff=0.6)
+        parts.append(f"'{name}'" + (f" (did you mean '{close[0]}'?)" if close else ""))
+    cols_note = ", ".join(all_cols[:10]) + ("…" if len(all_cols) > 10 else "")
+    return (
+        f"I couldn't find a column called {' or '.join(parts)} in your file. "
+        f"Available columns: {cols_note}. Which one should I use?"
+    )
+
+
+def _sane_plan(plan: object) -> dict:
+    """Guard against MALFORMED Brain output (PRD 1.3): the parser must hand back a dict
+    of {operations?, clarification?, reply?, ...}. Raw text, a list, None, or a plan
+    whose operations aren't a list of dicts would crash downstream `.get` calls with a
+    500 — normalize all of those to an empty plan, which flows into the standard
+    "I didn't understand that" answer instead of a fake result or a traceback."""
+    if not isinstance(plan, dict):
+        return {}
+    ops = plan.get("operations")
+    if ops is not None and (
+        not isinstance(ops, list) or any(not isinstance(op, dict) for op in ops)
+    ):
+        plan = dict(plan)
+        plan["operations"] = []
+    return plan
+
+
 def _describe_plan(operations: list[dict]) -> str:
     """A deterministic one-line plain-language restatement of a plan, used when the
     model didn't provide its own 'translation' (e.g. the offline fallback parser)."""
@@ -819,6 +1001,7 @@ async def parse(
     session_id: str = Form(""),
     history: str = Form(""),
     team_id: str = Form("default"),
+    org_id: str = Form(""),  # Phase 5.2: inherit this org's shared glossary
 ) -> JSONResponse:
     """Phase 1 of the two-phase flow: the Brain ONLY. Translate the instruction into an
     operation plan WITHOUT executing it, so the UI can preview the interpretation +
@@ -840,7 +1023,7 @@ async def parse(
     # Personalization (3.12): prepend the team's learned glossary + preferences to the
     # context so definitions are applied consistently (kept inside `history` so the call
     # signature is unchanged for callers/mocks).
-    glossary = personalization.context(team_id)
+    glossary = personalization.context(team_id, scope=org_id or None)
     context = (glossary + "\n\n" + history).strip() if glossary else history
 
     # Translate via the Brain (falling back to the deterministic parser if it's down).
@@ -851,7 +1034,7 @@ async def parse(
         key_missing = isinstance(exc, RuntimeError) and not unavailable
         if not (unavailable or key_missing):
             traceback.print_exc()
-        plan = fallback.parse(instruction, structure, personalization.definitions(team_id))
+        plan = fallback.parse(instruction, structure, personalization.effective_definitions(team_id, org_id or None))
         if plan is None:
             if unavailable:
                 return _error(str(exc), status=503)
@@ -862,6 +1045,7 @@ async def parse(
                 "this isn't a problem with your instruction. Please try again in a moment.",
                 status=502,
             )
+    plan = _sane_plan(plan)
 
     clarification = plan.get("clarification")
     reply = plan.get("reply")
@@ -884,6 +1068,14 @@ async def parse(
     # Personalization (3.12): fill the team's formatting defaults into the plan.
     operations = personalization.apply_preferences(operations, personalization.preferences(team_id))
 
+    # Plan validation (PRD 1.3): a plan that reads a column no sheet has is confidently
+    # wrong — turn it into a clarifying question instead of previewing a doomed plan.
+    phantom = _missing_columns(operations, tables)
+    if phantom:
+        return JSONResponse(
+            {"status": "clarify", "clarification": _missing_columns_clarification(phantom, tables)}
+        )
+
     translation = (plan.get("translation") or "").strip() or _describe_plan(operations)
     confidence = plan.get("confidence")
     if not isinstance(confidence, int) or not (0 <= confidence <= 100):
@@ -897,6 +1089,29 @@ async def parse(
     if (not steps or len(steps) != len(operations)) and len(operations) >= 2:
         steps = _synthesize_steps(operations)
 
+    # Agentic plan review (Phase 4.4): assess the ORDERED plan for destructive steps and
+    # surface each step's concrete impact ("removes 1,240 of 5,000 rows") HERE, at review
+    # time — so the user judges the whole plan-of-plans before approving it, not only after
+    # hitting run. Same guardrails engine /execute uses to gate destructive runs. Best-
+    # effort and read-only: it never mutates data and never blocks previewing a plan.
+    try:
+        review = guardrails.assess(operations, tables, primary, known_formulas=(entry or {}).get("formulas"))
+    except Exception:
+        review = {"destructive": False, "warnings": [], "summary": ""}
+    # Annotate each reviewable step with its impact when steps line up 1:1 with operations
+    # (guardrails warnings carry a 1-based step index), so the review card can badge the
+    # risky step inline instead of only listing warnings separately.
+    if steps and len(steps) == len(operations):
+        by_step = {w["step"]: w for w in review.get("warnings", [])}
+        annotated = []
+        for i, s in enumerate(steps, 1):
+            s = dict(s)
+            w = by_step.get(i)
+            s["impact"] = w["impact"] if w else None
+            s["severity"] = w["severity"] if w else None
+            annotated.append(s)
+        steps = annotated
+
     return JSONResponse(
         {
             "status": "plan",
@@ -904,6 +1119,10 @@ async def parse(
             "confidence": confidence,
             # Sensitive columns masked before the model saw them (Phase 3.9).
             "shielded_columns": _shield_columns(shielded),
+            # Plan review (Phase 4.4): destructive-step flags + per-step impact, computed
+            # against the real data, for the user to weigh BEFORE running. /execute still
+            # enforces confirmation independently — this is the informative half.
+            "review": review,
             # The full plan the UI hands back to /execute (no second Brain call).
             "plan": {
                 "operations": operations,
@@ -928,24 +1147,37 @@ def _run_operations(
     completed_steps = len(operations)  # all steps ran unless a later one fails
     failed_step = None
     shield_cols: list[str] = []  # /execute runs a pre-approved plan — no AI call, nothing to shield
-    try:
-        result, result_name, notes, render_ops = execute_multi(tables, primary, operations)
-    except MultiStepError as exc:
-        # A later step failed: keep the file reflecting the completed steps (PRD MS-b).
-        result, result_name = exc.partial_result, exc.partial_name
-        notes, render_ops = exc.notes, exc.format_ops
-        done = exc.failed_step - 1
-        completed_steps = done
-        failed_step = exc.failed_step
-        partial_warning = (
-            f"Step {exc.failed_step} couldn't be done: {exc.reason} "
-            f"Your file reflects the {done} step{'s' if done != 1 else ''} that "
-            "completed before it — fix that step and try again."
-        )
-    except OperationError as exc:
-        return _error(str(exc), status=422)
-    except Exception:
-        return _error(_INTERNAL_ERROR, status=500)
+    # Result cache (Phase 5.8): the same plan on the same data yields the same output, so a
+    # repeat run is a hit that skips the recompute entirely. Only CLEAN successes are cached
+    # (a partial failure isn't a stable result). State is still pushed on a hit, so chaining
+    # stays correct — the cache only saves the compute, never the bookkeeping.
+    cache_hit = False
+    _sig = scale.plan_signature(tables, operations)
+    _cached = scale.RESULT_CACHE.get(_sig)
+    if _cached is not None:
+        result, result_name, notes, render_ops = _cached
+        cache_hit = True
+    else:
+        try:
+            result, result_name, notes, render_ops = execute_multi(tables, primary, operations)
+        except MultiStepError as exc:
+            # A later step failed: keep the file reflecting the completed steps (PRD MS-b).
+            result, result_name = exc.partial_result, exc.partial_name
+            notes, render_ops = exc.notes, exc.format_ops
+            done = exc.failed_step - 1
+            completed_steps = done
+            failed_step = exc.failed_step
+            partial_warning = (
+                f"Step {exc.failed_step} couldn't be done: {exc.reason} "
+                f"Your file reflects the {done} step{'s' if done != 1 else ''} that "
+                "completed before it — fix that step and try again."
+            )
+        except OperationError as exc:
+            return _error(str(exc), status=422)
+        except Exception:
+            return _error(_INTERNAL_ERROR, status=500)
+        else:
+            scale.RESULT_CACHE.put(_sig, (result, result_name, notes, render_ops))
 
     # Push the new state so the next instruction chains on it (and Retry/Edit can branch).
     if session_id:
@@ -961,7 +1193,9 @@ def _run_operations(
                 "primary": result_name,
                 "exts": {**exts, result_name: exts.get(result_name, "xlsx")},
             }
+        new_state["label"] = _step_label(notes)  # labeled version history (Phase 3.2)
         _push_state(session_id, new_state)
+        _record_formulas(session_id, operations, result)  # dependency registry (Phase 4.8)
 
     biggest = max((len(t) for t in tables.values()), default=0)
     if biggest > 50_000:
@@ -972,7 +1206,7 @@ def _run_operations(
 
     try:
         if isinstance(result, dict):
-            out_bytes, out_name, media_type = _serialize_workbook(result, result_name)
+            out_bytes, out_name, media_type = _serialize_workbook(result, result_name, primary=result_name, render_ops=render_ops)
             row_count = sum(int(len(d)) for d in result.values())
         else:
             out_ext, upgrade_note = _output_ext(exts.get(result_name, "xlsx"), render_ops)
@@ -992,9 +1226,11 @@ def _run_operations(
         {
             "status": "ok",
             "session_id": session_id,
+            "cached": cache_hit,  # Phase 5.8: this result came from the cache (recompute skipped)
             "explanation": " ".join(notes) if notes else "No changes were needed.",
             "notes": notes,
             "formulas": _describe_formulas(render_ops),
+            "code": _explain_code(operations),  # Phase 3.3 "Show Code" — mirrors the executed plan
             # Confidence on forecasts/anomalies (Phase 3.10).
             "analysis": [d for d in render_ops if d.get("type") == "analysis"],
             "row_count": row_count,
@@ -1053,6 +1289,21 @@ async def execute(
     operations = parsed.get("operations") or []
     if not operations:
         return _error("There's nothing to run.", status=400)
+    # Shape-check every step before executing. /process routes Brain output through
+    # _sane_plan; /execute takes a plan from the UI (which the user can hand-edit), so
+    # it needs the same guard. Without it a null/!dict step reached the executor and
+    # surfaced as a 500 blaming the server — when the real cause is a malformed step
+    # the user can fix.
+    bad = next(
+        (i for i, op in enumerate(operations, 1) if not isinstance(op, dict) or not op.get("action")),
+        None,
+    )
+    if bad is not None:
+        return _error(
+            f"Step {bad} of that plan isn't a valid operation — each step needs an "
+            "\"action\". Edit the plan and try again.",
+            status=422,
+        )
     ai_title = (parsed.get("title") or "").strip() or None
 
     # Guardrails (3.10): warn before destructive actions, with concrete impact. Opt-in via
@@ -1060,7 +1311,7 @@ async def execute(
     want_guard = str(guard).strip().lower() in ("1", "true", "yes")
     confirmed = str(confirm).strip().lower() in ("1", "true", "yes")
     if want_guard and not confirmed:
-        assessment = guardrails.assess(operations, base["tables"], base["primary"])
+        assessment = guardrails.assess(operations, base["tables"], base["primary"], known_formulas=(entry or {}).get("formulas"))
         if assessment["destructive"]:
             return JSONResponse({
                 "status": "confirm_required",
@@ -1098,10 +1349,33 @@ async def process(
     rewind: int = Form(-1),
     history: str = Form(""),
     team_id: str = Form("default"),
+    org_id: str = Form(""),  # Phase 5.2: inherit this org's shared glossary
+    compliance_mode: str = Form(""),  # Phase 5.5: e.g. "GDPR,HIPAA" — widen the PII shield
+    # Voice input & spoken feedback (Phase 3.6). `input_source` is "text" (default) or
+    # "voice"; a voice transcript is normalized + confidence-checked before we act.
+    # `feedback_mode` (silent/step/summary) shapes the `speech` field in the response.
+    input_source: str = Form("text"),
+    feedback_mode: str = Form(voice.DEFAULT_MODE),
+    transcript_confidence: float = Form(1.0),
     files: list[UploadFile] = File(default=[]),
 ) -> JSONResponse:
     started_at = time.time()
     instruction = (instruction or "").strip()
+    speak_mode = (feedback_mode or voice.DEFAULT_MODE).strip().lower()
+
+    def _spk(text: str | None) -> str | None:
+        """Spoken form of a one-off message (clarify/reply), honoring silent mode."""
+        return None if speak_mode == "silent" else text
+
+    # Voice input (Phase 3.6): transcripts are noisy — strip spoken fillers, then assess
+    # before doing anything. On empty/low-confidence/garbled audio we decline gracefully
+    # and ask the user to repeat rather than risk acting on a misheard command.
+    if (input_source or "").strip().lower() == "voice":
+        instruction = voice.normalize_transcript(instruction)
+        ok, msg = voice.assess_transcript(instruction, transcript_confidence)
+        if not ok:
+            return JSONResponse({"status": "clarify", "clarification": msg, "speech": _spk(msg)})
+
     if not instruction:
         return _error("Please describe what you'd like done to the data.", status=400)
 
@@ -1150,11 +1424,15 @@ async def process(
     # 2. Summarize all tables for the model so it can plan across files.
     structure = summarize_tables(tables, primary)
     # PII shield (3.9): mask sensitive sample values + history BEFORE the model sees them.
-    structure, shielded = pii.redact_structure(structure, pii.scan_tables(tables))
+    # Compliance profiles (5.5) WIDEN the scan with regime-specific fields (HIPAA MRN, IRDAI
+    # policy no, …) so they're masked too; with none set, this is the base shield unchanged.
+    profiles = compliance.parse_profiles(compliance_mode)
+    scan = compliance.sensitive_columns(tables, profiles) if profiles else pii.scan_tables(tables)
+    structure, shielded = pii.redact_structure(structure, scan)
     history = pii.redact_text(history)
     # Personalization (3.12): prepend the team's learned glossary + preferences to the
     # context so definitions are applied consistently (kept inside `history`).
-    glossary = personalization.context(team_id)
+    glossary = personalization.context(team_id, scope=org_id or None)
     context = (glossary + "\n\n" + history).strip() if glossary else history
 
     # 3. Translate the instruction into an operation plan.
@@ -1169,7 +1447,7 @@ async def process(
         key_missing = isinstance(exc, RuntimeError) and not unavailable
         if not (unavailable or key_missing):
             traceback.print_exc()  # log the real cause; never blame the instruction
-        plan = fallback.parse(instruction, structure, personalization.definitions(team_id))
+        plan = fallback.parse(instruction, structure, personalization.effective_definitions(team_id, org_id or None))
         if plan is None:
             if unavailable:
                 return _error(str(exc), status=503)
@@ -1180,6 +1458,7 @@ async def process(
                 "this isn't a problem with your instruction. Please try again in a moment.",
                 status=502,
             )
+    plan = _sane_plan(plan)
 
     clarification = plan.get("clarification")
     reply = plan.get("reply")
@@ -1188,21 +1467,25 @@ async def process(
     if not operations:
         # No action to take: answer a data question, ask for clarity, or nudge.
         if reply:
-            return JSONResponse({"status": "message", "message": reply})
+            return JSONResponse({"status": "message", "message": reply, "speech": _spk(reply)})
         if clarification:
-            return JSONResponse({"status": "clarify", "clarification": clarification})
-        return JSONResponse(
-            {
-                "status": "message",
-                "message": (
-                    "I didn't understand that — try describing the task, e.g. "
-                    '"sort by Revenue descending" or "remove duplicate rows".'
-                ),
-            }
+            return JSONResponse({"status": "clarify", "clarification": clarification, "speech": _spk(clarification)})
+        nudge = (
+            "I didn't understand that — try describing the task, e.g. "
+            '"sort by Revenue descending" or "remove duplicate rows".'
         )
+        return JSONResponse({"status": "message", "message": nudge, "speech": _spk(nudge)})
 
     # Personalization (3.12): fill the team's formatting defaults into the plan.
     operations = personalization.apply_preferences(operations, personalization.preferences(team_id))
+
+    # Plan validation (PRD 1.3): never execute a plan that reads a column no sheet has —
+    # ask instead. (The executor would also catch it, but a clarifying question with a
+    # did-you-mean beats an error after the fact.)
+    phantom = _missing_columns(operations, tables)
+    if phantom:
+        _clar = _missing_columns_clarification(phantom, tables)
+        return JSONResponse({"status": "clarify", "clarification": _clar, "speech": _spk(_clar)})
 
     # 4. Execute the plan across all tables.
     partial_warning = None
@@ -1245,7 +1528,9 @@ async def process(
                 "primary": result_name,
                 "exts": {**exts, result_name: exts.get(result_name, "xlsx")},
             }
+        new_state["label"] = _step_label(notes)  # labeled version history (Phase 3.2)
         _push_state(session_id, new_state)
+        _record_formulas(session_id, operations, result)  # dependency registry (Phase 4.8)
 
     # Large-file notice (PRD: big files still work, but tell the user).
     biggest = max((len(t) for t in tables.values()), default=0)
@@ -1262,11 +1547,16 @@ async def process(
             f"Shielded {len(shield_cols)} sensitive field"
             f"{'s' if len(shield_cols) != 1 else ''} from the AI: {', '.join(shield_cols)}."
         ] + notes
+        # Audit trail (5.5): record WHAT was shielded (field names/counts only, never values)
+        # and under which compliance regime — so "what happened to sensitive data?" is answerable.
+        audit.record("pii_shielded", actor=team_id,
+                     detail=f"Masked {len(shield_cols)} field(s) before the AI.",
+                     meta={"columns": shield_cols, "compliance": profiles})
 
     # 6. Serialize. The result is either one table or a multi-sheet workbook.
     try:
         if isinstance(result, dict):
-            out_bytes, out_name, media_type = _serialize_workbook(result, result_name)
+            out_bytes, out_name, media_type = _serialize_workbook(result, result_name, primary=result_name, render_ops=render_ops)
             row_count = sum(int(len(d)) for d in result.values())
         else:
             out_ext, upgrade_note = _output_ext(exts.get(result_name, "xlsx"), render_ops)
@@ -1291,6 +1581,11 @@ async def process(
             "explanation": " ".join(notes) if notes else "No changes were needed.",
             "notes": notes,
             "formulas": _describe_formulas(render_ops),
+            "code": _explain_code(operations),  # Phase 3.3 "Show Code" — mirrors the executed plan
+            # Spoken feedback (Phase 3.6): a TTS-ready line shaped to the user's chosen
+            # verbosity (silent/step/summary). null in silent mode. Purely a view over
+            # the real per-step notes — never a fresh, driftable description.
+            "speech": voice.spoken_feedback(notes, speak_mode),
             # Confidence on forecasts/anomalies (Phase 3.10).
             "analysis": [d for d in render_ops if d.get("type") == "analysis"],
             "row_count": row_count,
@@ -1455,14 +1750,20 @@ def _summarize_insight(result, result_name: str) -> str | None:
                 .dropna(subset=["_v"])
                 .groupby("_c")["_v"].sum()
             )
-            if len(grouped) >= 2:
+            # A "% of the total" share is only meaningful as a part-of-whole when every
+            # group's contribution is non-negative and the top is a sane 0–100% slice.
+            # Mixed-sign data (e.g. profit with losses) can make top_val exceed the total
+            # → a >100% "share" would be a fabricated-looking claim; fall through to the
+            # always-correct average+range instead.
+            if len(grouped) >= 2 and float(grouped.min()) >= 0:
                 top = str(grouped.idxmax())
                 top_val = float(grouped.max())
                 share = round(top_val / total * 100)
-                return (
-                    f"{cat} “{top}” is the largest, at {share}% of {value} "
-                    f"({_abbrev(top_val)} of {_abbrev(total)})."
-                )
+                if 0 <= share <= 100:
+                    return (
+                        f"{cat} “{top}” is the largest, at {share}% of {value} "
+                        f"({_abbrev(top_val)} of {_abbrev(total)})."
+                    )
         # numeric-only fallback: average + range (all real figures)
         return (
             f"{value} averages {_abbrev(float(vseries.mean()))}, "
@@ -1486,6 +1787,70 @@ def _describe_formulas(render_ops: list[dict]) -> list[str]:
     return out
 
 
+def _explain_code(operations: list[dict]) -> list[str]:
+    """Phase 3.3 'Show Code': a faithful, pandas-flavored rendering of the EXACT plan
+    that ran. It's built from the executed `operations`, so it always matches what
+    actually happened (never a separate AI re-description that could drift)."""
+    def L(x):  # compact repr for a list of column names
+        return ", ".join(map(str, x or []))
+
+    lines: list[str] = []
+    for op in operations:
+        a = op.get("action")
+        try:
+            if a == "sort":
+                cols = op.get("columns") or []
+                orders = op.get("orders") or []
+                asc = [str(orders[i] if i < len(orders) else "asc").lower() != "desc" for i in range(len(cols))]
+                lines.append(f"df = df.sort_values([{L(cols)}], ascending={asc})")
+            elif a == "filter":
+                conds = op.get("conditions") or []
+                parts = [f"{c.get('column')} {c.get('operator')} {c.get('value')!r}" for c in conds]
+                j = " & " if (op.get("combine") or "and").lower() == "and" else " | "
+                lines.append(f"df = df[{j.join(parts)}]")
+            elif a == "limit":
+                lines.append(f"df = df.{'tail' if op.get('from_end') else 'head'}({op.get('count')})")
+            elif a == "remove_duplicates":
+                lines.append(f"df = df.drop_duplicates(subset=[{L(op.get('columns'))}] or all)")
+            elif a == "add_formula_column":
+                lines.append(f"df[{op.get('name')!r}] = {op.get('formula')}")
+            elif a == "aggregate":
+                lines.append(f"df = df.groupby([{L(op.get('group_by'))}])[{op.get('agg_column')!r}]"
+                             f".{op.get('agg_func') or 'agg'}()")
+            elif a in ("pivot", "pivot_summary"):
+                lines.append(f"df = pivot(index=[{L(op.get('group_by') or op.get('index_columns'))}], "
+                             f"columns={op.get('pivot_column')!r}, values={op.get('value_column')!r}, "
+                             f"agg={op.get('agg_func') or 'sum'!r})")
+            elif a == "lookup":
+                lines.append(f"df[{(op.get('new_column') or op.get('return_column'))!r}] = "
+                             f"lookup(df[{op.get('key_column')!r}], "
+                             f"{op.get('source_sheet')!r}[{op.get('source_key_column')!r}] -> {op.get('return_column')!r})")
+            elif a == "rename_columns":
+                m = dict(zip(op.get("rename_from") or [], op.get("rename_to") or []))
+                lines.append(f"df = df.rename(columns={m})")
+            elif a == "drop_columns":
+                lines.append(f"df = df.drop(columns=[{L(op.get('columns'))}])")
+            elif a == "select_columns":
+                lines.append(f"df = df[[{L(op.get('columns'))}]]")
+            elif a == "find_replace":
+                where = f" in {op.get('column')!r}" if op.get("column") else ""
+                lines.append(f"df = df.replace({op.get('find')!r}, {op.get('replace')!r}){where}")
+            elif a in ("merge", "combine_sheets"):
+                lines.append(f"df = {a}([{L(op.get('merge_tables') or op.get('sheet_tables'))}])")
+            elif a in ("fill_missing", "drop_missing", "flag_missing", "trim", "drop_invalid"):
+                lines.append(f"df = {a}(columns=[{L(op.get('columns'))}]"
+                             + (f", value={op.get('fill_value')!r}" if op.get("fill_value") is not None else "") + ")")
+            else:
+                params = {k: v for k, v in op.items() if k not in ("action", "table") and v is not None}
+                inside = ", ".join(f"{k}={v!r}" for k, v in list(params.items())[:6])
+                lines.append(f"df = {a}({inside})")
+            if op.get("table"):
+                lines[-1] += f"   # on table '{op['table']}'"
+        except Exception:
+            lines.append(f"df = {a}(...)")  # never let the code view break the response
+    return lines
+
+
 def _output_ext(in_ext: str, render_ops: list[dict]) -> tuple[str, str | None]:
     """Choose the download extension. A .csv can't carry live formulas, formatting, or
     charts, so when an operation produced any render directive (formula/lookup/format/
@@ -1504,16 +1869,24 @@ def _output_ext(in_ext: str, render_ops: list[dict]) -> tuple[str, str | None]:
     return in_ext, None
 
 
-def _serialize_workbook(sheets: dict, base_name: str) -> tuple[bytes, str, str]:
-    """Write several tables into ONE .xlsx, each on its own sheet/tab."""
+def _serialize_workbook(
+    sheets: dict, base_name: str, primary: str | None = None, render_ops: list | None = None
+) -> tuple[bytes, str, str]:
+    """Write several tables into ONE .xlsx, each on its own sheet/tab. Render directives
+    (live formulas / formatting) apply to the PRIMARY sheet, after every sheet exists —
+    cross-sheet formula ranges (Prices!$B$2:...) need the other tabs in place."""
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         taken: set[str] = set()
+        placed: dict[str, str] = {}
         for name, d in sheets.items():
             sheet_name = _safe_sheet_name(name, taken)
             taken.add(sheet_name)
+            placed[name] = sheet_name
             d.to_excel(writer, index=False, sheet_name=sheet_name)
             _disarm_injection(writer.sheets[sheet_name])
+        if render_ops and primary in placed:
+            _apply_render(writer, placed[primary], sheets[primary], render_ops)
     stem = (base_name or "combined").rsplit(".", 1)[0]
     return (
         buf.getvalue(),
@@ -1561,14 +1934,86 @@ def _apply_render(writer, main_name: str, df, render_ops: list[dict]) -> None:
     """Apply each render directive (formatting / live formula / highlight / lookup)
     to the workbook. Only meaningful for .xlsx output."""
     ws = writer.sheets[main_name]
+    # Ordering: layout runs LAST of the row-anchored kinds (its title row shifts rows,
+    # translating already-written formulas/CF/DV/tables) — and comments run after even
+    # that, computing their own row offset, since openpyxl's insert_rows doesn't move
+    # comment anchors.
+    render_ops = sorted(
+        render_ops,
+        key=lambda d: (d.get("type") == "layout") + 2 * (d.get("type") == "comments"),
+    )
+    title_offset = 1 if any(
+        d.get("type") == "layout" and d.get("title") for d in render_ops
+    ) else 0
     for directive in render_ops:
         kind = directive.get("type")
         if kind == "format":
             _apply_format(ws, df, directive)
         elif kind == "formula":
-            _apply_formula(ws, df, directive)
+            _apply_formula(writer, ws, df, directive)
         elif kind == "highlight":
             _apply_highlight(ws, df, directive)
+        elif kind == "cf":
+            _apply_cf(ws, df, directive)
+        elif kind == "dv":
+            _apply_dv(writer, ws, df, directive)
+        elif kind == "table":
+            _apply_table(ws, df, directive)
+        elif kind == "pivot_formula":
+            _apply_pivot_formula(writer, ws, df, directive)
+        elif kind == "comments":
+            _apply_comments(ws, df, directive, title_offset)
+        elif kind == "defined_name":
+            from openpyxl.workbook.defined_name import DefinedName
+
+            col = directive.get("column")
+            cols = list(df.columns)
+            if col in cols:
+                letter = get_column_letter(cols.index(col) + 1)
+                sheet_ref = _excel_sheet_ref(ws.title)
+                attr = f"{sheet_ref}!${letter}$2:${letter}${len(df) + 1}"
+                dn_name = directive.get("name")
+                if dn_name in ws.parent.defined_names:
+                    del ws.parent.defined_names[dn_name]
+                ws.parent.defined_names[dn_name] = DefinedName(dn_name, attr_text=attr)
+        elif kind == "goal_seek_sheet":
+            name = _safe_sheet_name("Goal Seek", set(writer.book.sheetnames))
+            gs = writer.book.create_sheet(name)
+            writer.sheets[name] = gs
+            for r, row in enumerate(directive.get("rows") or [], start=1):
+                for c, val in enumerate(row, start=1):
+                    gs.cell(row=r, column=c, value=val)
+            gs["A1"].font = Font(bold=True, size=12)
+            gs.column_dimensions["A"].width = 14
+            gs.column_dimensions["B"].width = 44
+        elif kind == "stats_sheet":
+            # Phase 2.3: a small "label / value" summary sheet for regression / t-test
+            # (data itself is unchanged). Same shape as goal_seek_sheet, named per directive.
+            sname = _safe_sheet_name(directive.get("sheet_name") or "Analysis", set(writer.book.sheetnames))
+            st = writer.book.create_sheet(sname)
+            writer.sheets[sname] = st
+            for r, row in enumerate(directive.get("rows") or [], start=1):
+                for c, val in enumerate(row, start=1):
+                    st.cell(row=r, column=c, value=val)
+            st["A1"].font = Font(bold=True, size=12)
+            st.column_dimensions["A"].width = 22
+            st.column_dimensions["B"].width = 48
+        elif kind == "sheet_style":
+            real = _resolve_sheet_name(writer.sheets.keys(), directive.get("sheet_name") or "")
+            if real is not None:
+                target_ws = writer.sheets[real]
+                if directive.get("tab_color"):
+                    target_ws.sheet_properties.tabColor = directive["tab_color"]
+                if "hidden" in directive:
+                    target_ws.sheet_state = "hidden" if directive["hidden"] else "visible"
+        elif kind == "sheet_protect":
+            _apply_sheet_protect(writer, directive)
+        elif kind == "workbook_protect":
+            from openpyxl.workbook.protection import WorkbookProtection
+
+            writer.book.security = WorkbookProtection(lockStructure=bool(directive.get("lock_structure")))
+        elif kind == "layout":
+            _apply_layout(ws, df, directive)
         elif kind == "lookup":
             _apply_lookup(writer, ws, df, directive)
         elif kind == "chart":
@@ -1577,10 +2022,17 @@ def _apply_render(writer, main_name: str, df, render_ops: list[dict]) -> None:
             _apply_dashboard(writer, main_name, df, directive)
 
 
-_CHART_CLASSES = {"bar": BarChart, "line": LineChart, "pie": PieChart, "area": AreaChart}
+# Category charts share one build path (labels on the x-axis + value series).
+_CATEGORY_CLASSES = {
+    "bar": BarChart, "line": LineChart, "area": AreaChart, "pie": PieChart,
+    "doughnut": DoughnutChart, "radar": RadarChart, "stock": StockChart,
+}
+# XY charts plot numbers against numbers (a distinct openpyxl API).
+_XY_CLASSES = {"scatter": ScatterChart, "bubble": BubbleChart}
 
 
-def _build_chart(data_ws, df, chart_type, x_col, y_cols, title, height=8, width=16):
+def _build_chart(data_ws, df, chart_type, x_col, y_cols, title, height=8, width=16,
+                 size_col=None):
     """Build an openpyxl chart that references `data_ws`'s cells, so it always reflects
     the current data. Returns the chart, or None if the request can't be charted.
     `data_ws` may differ from the chart's host sheet (the dashboard charts the data
@@ -1590,20 +2042,47 @@ def _build_chart(data_ws, df, chart_type, x_col, y_cols, title, height=8, width=
     n = len(df)
     if x_col not in columns or not y_cols or n == 0:
         return None
-    chart = _CHART_CLASSES.get(chart_type, BarChart)()
-    if chart_type == "bar":
-        chart.type = "col"  # vertical columns
+    col_idx = lambda c: columns.index(c) + 1  # noqa: E731 (1-based worksheet column)
+
+    if chart_type in _XY_CLASSES:
+        chart = _XY_CLASSES[chart_type]()
+        xref = Reference(data_ws, min_col=col_idx(x_col), min_row=2, max_row=n + 1)
+        if chart_type == "bubble":
+            size_col = size_col if size_col in columns else y_cols[0]
+            yref = Reference(data_ws, min_col=col_idx(y_cols[0]), min_row=1, max_row=n + 1)
+            zref = Reference(data_ws, min_col=col_idx(size_col), min_row=2, max_row=n + 1)
+            chart.series.append(Series(yref, xref, zvalues=zref, title_from_data=True))
+        else:  # scatter — one XY series per value column, drawn as points
+            for c in y_cols:
+                yref = Reference(data_ws, min_col=col_idx(c), min_row=1, max_row=n + 1)
+                s = Series(yref, xref, title_from_data=True)
+                s.marker = Marker(symbol="circle", size=6)
+                s.graphicalProperties.line.noFill = True  # points, not a connecting line
+                chart.series.append(s)
+        chart.x_axis.title = x_col
+        chart.y_axis.title = ", ".join(y_cols)
+    else:
+        chart = _CATEGORY_CLASSES.get(chart_type, BarChart)()
+        if chart_type == "bar":
+            chart.type = "col"  # vertical columns
+        if chart_type == "radar":
+            chart.type = "marker"
+        for c in y_cols:
+            chart.add_data(Reference(data_ws, min_col=col_idx(c), min_row=1, max_row=n + 1),
+                           titles_from_data=True)
+        chart.set_categories(Reference(data_ws, min_col=col_idx(x_col), min_row=2, max_row=n + 1))
+        if chart_type == "stock" and len(y_cols) >= 2:
+            from openpyxl.chart.axis import ChartLines
+
+            chart.hiLowLines = ChartLines()  # the high-low connectors that make it a stock chart
+            for s in chart.series:  # markers, no connecting fill line
+                s.graphicalProperties.line.noFill = True
+                s.marker = Marker(symbol="dot", size=5)
+
     if title:
         chart.title = title
     chart.height = height
     chart.width = width
-    # Values include the header row so each series is named (titles_from_data).
-    for col in y_cols:
-        idx = columns.index(col) + 1
-        chart.add_data(Reference(data_ws, min_col=idx, min_row=1, max_row=n + 1), titles_from_data=True)
-    # Categories are the x-axis labels — data rows only (skip the header).
-    x_idx = columns.index(x_col) + 1
-    chart.set_categories(Reference(data_ws, min_col=x_idx, min_row=2, max_row=n + 1))
     return chart
 
 
@@ -1612,6 +2091,7 @@ def _apply_chart(ws, df, directive: dict) -> None:
     chart = _build_chart(
         ws, df, directive.get("chart_type"), directive.get("x_column"),
         directive.get("y_columns"), directive.get("title"),
+        size_col=directive.get("size_column"),
     )
     if chart is None:
         return
@@ -1662,6 +2142,7 @@ def _apply_dashboard(writer, main_name: str, df, directive: dict) -> None:
         chart = _build_chart(
             data_ws, df, spec.get("chart_type"), spec.get("x_column"),
             spec.get("y_columns"), spec.get("title"), height=7, width=13,
+            size_col=spec.get("size_column"),
         )
         if chart is None:
             continue
@@ -1670,14 +2151,65 @@ def _apply_dashboard(writer, main_name: str, df, directive: dict) -> None:
 
 
 def _safe_sheet_name(base: str, taken: set[str]) -> str:
-    """A valid, unique Excel sheet name (<=31 chars, no : \\ / ? * [ ])."""
-    name = re.sub(r"[:\\/?*\[\]]", " ", str(base)).strip()[:28] or "Lookup"
+    """A valid, unique Excel sheet name (<=31 chars, no : \\ / ? * [ ]).
+
+    Multi-file table names look like 'long_file_name - Sales'; when truncating, keep
+    the SHEET part (the ' - ' tail) and trim the file stem instead — that's what users
+    recognize on the tab, and cross-sheet formulas resolve sheets by that tail."""
+    name = re.sub(r"[:\\/?*\[\]]", " ", str(base)).strip() or "Lookup"
+    if len(name) > 28:
+        stem, sep, tail = name.rpartition(" - ")
+        if sep and tail:
+            room = 28 - len(sep + tail)
+            name = (stem[:room].rstrip() + sep + tail) if room > 0 else tail[:28]
+        else:
+            name = name[:28]
     candidate = name
     i = 2
     while candidate in taken:
         candidate = f"{name} {i}"[:31]
         i += 1
     return candidate
+
+
+def _apply_pivot_formula(writer, main_ws, df, directive: dict) -> None:
+    """Phase 2.1 live mode: put the pivot's SOURCE data on its own sheet and replace
+    the statically-written grid with a single live =GROUPBY()/=PIVOTBY() spill
+    formula anchored at A1. The preview keeps the computed values (a written formula
+    has no cached value); the note warns these functions need Microsoft 365."""
+    src = directive.get("source_df")
+    if src is None or len(src) == 0:
+        return
+    sheet_name = _safe_sheet_name("Pivot Data", set(writer.book.sheetnames))
+    src.to_excel(writer, index=False, sheet_name=sheet_name)
+    src_ws = writer.sheets[sheet_name]
+    _disarm_injection(src_ws)  # source cells are uploaded data too
+
+    q = sheet_name.replace("'", "''")
+    n = len(src)
+
+    def rng(c1: int, c2: int) -> str:
+        # Header row INCLUDED — paired with field_headers=3 so the spill shows labels.
+        return f"'{q}'!${get_column_letter(c1)}$1:${get_column_letter(c2)}${n + 1}"
+
+    row_fields = directive.get("rows") or []
+    func = directive.get("func") or "SUM"
+    totals = 1 if directive.get("totals") else 0
+    row_range = rng(1, len(row_fields))
+    val_idx = len(src.columns)  # the value column is always last in the source frame
+    val_range = rng(val_idx, val_idx)
+    if directive.get("column"):
+        col_idx = len(row_fields) + 1
+        formula = (f"=PIVOTBY({row_range},{rng(col_idx, col_idx)},{val_range},"
+                   f"{func},3,{totals},,{totals})")
+    else:
+        formula = f"=GROUPBY({row_range},{val_range},{func},3,{totals})"
+
+    # Clear the static grid so the spill has room (a value in its way = #SPILL!).
+    for r in range(1, len(df) + 2):
+        for c in range(1, len(df.columns) + 1):
+            main_ws.cell(row=r, column=c).value = None
+    main_ws["A1"].value = formula
 
 
 def _apply_lookup(writer, main_ws, df, directive: dict) -> None:
@@ -1724,10 +2256,16 @@ def _apply_lookup(writer, main_ws, df, directive: dict) -> None:
 
     match_range = f"'{q}'!${helper_l}$2:${helper_l}${n + 1}"
     return_range = f"'{q}'!${sret_l}$2:${sret_l}${n + 1}"
+    # Rows matched only by fuzzy similarity (Phase 3.1) get a STATIC value — a typo
+    # match ("Jon"→"John") can't be reproduced by an exact-match Excel formula.
+    static_overrides = directive.get("static_overrides") or {}
     for i in range(len(df)):
         r = i + 2
-        formula = _lookup_formula(f"{key_l}{r}", match_range, return_range)
-        main_ws.cell(row=r, column=target, value=formula)
+        if i in static_overrides:
+            main_ws.cell(row=r, column=target, value=static_overrides[i])
+        else:
+            formula = _lookup_formula(f"{key_l}{r}", match_range, return_range)
+            main_ws.cell(row=r, column=target, value=formula)
 
 
 def _norm_key_formula(key_cell: str) -> str:
@@ -1769,27 +2307,519 @@ def _apply_format(ws, df, directive: dict) -> None:
             ws.cell(row=row, column=col_idx).number_format = code
 
 
-def _apply_formula(ws, df, directive: dict) -> None:
-    """Write LIVE Excel formulas (e.g. =B2*C2) down the formula column, translating
-    {ColumnName} placeholders into real cell references from the final layout."""
+def _excel_sheet_ref(sheet: str) -> str:
+    """Quote a sheet name for use in a formula when it isn't a plain identifier."""
+    return sheet if re.fullmatch(r"[A-Za-z0-9_]+", sheet) else "'" + sheet.replace("'", "''") + "'"
+
+
+def _apply_formula(writer, ws, df, directive: dict) -> None:
+    """Write LIVE Excel formulas down the formula column, translating the Phase-1.1
+    template grammar into real references from the final layout:
+        {Col}        -> B2           (this row's cell)
+        {Col:}       -> $B$2:$B$201  (the column's data range)
+        {Sheet.Col:} -> Prices!$B$2:$B$6 (another sheet's range, located by header)
+    A directive marked spill (UNIQUE/SORT/FILTER/SEQUENCE) is written ONCE in the first
+    data cell — Excel spills the rest. If any reference can't be resolved in the final
+    workbook (column dropped, sheet renamed), the computed values are kept instead of
+    writing a broken formula."""
     columns = list(df.columns)
     name = directive.get("column")
     template = directive.get("formula") or ""
     if name not in columns:
         return
-    referenced = _PLACEHOLDER.findall(template)
-    # If any referenced column is gone (renamed/dropped later), keep the computed
-    # values rather than writing a broken formula.
-    if any(r not in columns for r in referenced):
+    last_row = len(df) + 1  # data ends here (row 1 is the header)
+
+    def resolve(inner: str, excel_row: int) -> str | None:
+        text = inner.strip()
+        is_range = text.endswith(":")
+        if is_range:
+            text = text[:-1].strip()
+        if is_range and "." in text:
+            sheet, col = (p.strip() for p in text.split(".", 1))
+            real = _resolve_sheet_name(writer.sheets.keys(), sheet)
+            if real is None and sheet in (directive.get("source_sheets") or {}):
+                # The referenced sheet isn't in the output — write it from the data the
+                # executor attached, so the live formula has a real range to point at.
+                src_df = directive["source_sheets"][sheet]
+                real = _safe_sheet_name(sheet, set(writer.book.sheetnames))
+                src_df.to_excel(writer, index=False, sheet_name=real)
+                _disarm_injection(writer.sheets[real])
+            ws2 = writer.sheets.get(real) if real else None
+            if ws2 is None:
+                return None
+            sheet = real
+            headers = [c.value for c in ws2[1]]
+            if col not in headers:
+                return None
+            letter = get_column_letter(headers.index(col) + 1)
+            return f"{_excel_sheet_ref(sheet)}!${letter}$2:${letter}${max(ws2.max_row, 2)}"
+        if text not in columns:
+            return None
+        letter = get_column_letter(columns.index(text) + 1)
+        if is_range:
+            return f"${letter}$2:${letter}${last_row}"
+        return f"{letter}{excel_row}"
+
+    # Dry-run row 2 first: if anything is unresolvable, keep the computed values.
+    if any(resolve(m, 2) is None for m in _PLACEHOLDER.findall(template)):
         return
+
     target_idx = columns.index(name) + 1
-    for i in range(len(df)):
-        excel_row = i + 2  # row 1 is the header
-        cell_formula = _PLACEHOLDER.sub(
-            lambda m: f"{get_column_letter(columns.index(m.group(1)) + 1)}{excel_row}",
-            template,
-        )
+    if directive.get("spill"):
+        # A spill needs EMPTY cells below its anchor or Excel shows #SPILL! — clear the
+        # padded preview values, then write the one spilling formula. (Assign .value
+        # directly: openpyxl's cell(value=None) leaves the cell untouched.)
+        for excel_row in range(3, last_row + 1):
+            ws.cell(row=excel_row, column=target_idx).value = None
+        rows = [2]
+    else:
+        rows = range(2, last_row + 1)
+    for excel_row in rows:
+        cell_formula = _PLACEHOLDER.sub(lambda m: resolve(m.group(1), excel_row), template)
         ws.cell(row=excel_row, column=target_idx, value="=" + cell_formula)
+
+
+def _apply_cf(ws, df, directive: dict) -> None:
+    """Turn a 'cf' directive into REAL Excel conditional-formatting rules (Phase 1.2) —
+    the rules stay live, so highlights update as the user edits the file."""
+    from .operations.conditional_format import COLORS as _CF_COLORS
+    from .operations.conditional_format import ICON_SETS as _CF_ICONS
+    from .operations.conditional_format import STRONG as _CF_STRONG
+
+    columns = list(df.columns)
+    rule = directive.get("rule_type")
+    fill_name = directive.get("color") or {"duplicates": "red", "blanks": "yellow"}.get(rule, "green")
+    fill_hex, font_hex = _CF_COLORS.get(fill_name, _CF_COLORS["green"])
+    fill = PatternFill(start_color=fill_hex, end_color=fill_hex, fill_type="solid")
+    font = Font(color=font_hex)
+    dxf = DifferentialStyle(fill=fill, font=font)
+    last = len(df) + 1
+    value, value2 = directive.get("value"), directive.get("value2")
+
+    for col in directive.get("columns") or []:
+        if col not in columns:
+            continue
+        letter = get_column_letter(columns.index(col) + 1)
+        rng = f"{letter}2:{letter}{last}"
+        obj = None
+        if rule in ("greater_than", "less_than", "equal_to", "not_equal", "between"):
+            op_name = {"greater_than": "greaterThan", "less_than": "lessThan",
+                       "equal_to": "equal", "not_equal": "notEqual", "between": "between"}[rule]
+            formulas = [str(value)] + ([str(value2)] if rule == "between" else [])
+            obj = CellIsRule(operator=op_name, formula=formulas, fill=fill, font=font)
+        elif rule == "text_contains":
+            text = str(value).replace('"', '""')
+            obj = FormulaRule(
+                formula=[f'ISNUMBER(SEARCH("{text}",{letter}2))'], fill=fill, font=font)
+        elif rule in ("date_before", "date_after"):
+            d = pd.to_datetime(str(value))
+            cmp_ = "<" if rule == "date_before" else ">"
+            obj = FormulaRule(
+                formula=[f"AND({letter}2<>\"\",{letter}2{cmp_}DATE({d.year},{d.month},{d.day}))"],
+                fill=fill, font=font)
+        elif rule == "blanks":
+            obj = Rule(type="containsBlanks", dxf=dxf,
+                       formula=[f"LEN(TRIM({letter}2))=0"])
+        elif rule in ("duplicates", "unique"):
+            obj = Rule(type="duplicateValues" if rule == "duplicates" else "uniqueValues", dxf=dxf)
+        elif rule in ("top_n", "bottom_n"):
+            obj = Rule(type="top10", rank=int(directive.get("count") or 10),
+                       percent=bool(directive.get("percent")), bottom=rule == "bottom_n", dxf=dxf)
+        elif rule == "color_scale":
+            obj = ColorScaleRule(
+                start_type="min", start_color="F8696B",
+                mid_type="percentile", mid_value=50, mid_color="FFEB84",
+                end_type="max", end_color="63BE7B")
+        elif rule == "data_bars":
+            obj = DataBarRule(start_type="min", end_type="max",
+                              color=_CF_STRONG.get(fill_name, "638EC6"))
+        elif rule == "icon_set":
+            obj = IconSetRule(icon_style=_CF_ICONS.get(int(directive.get("icons") or 3), "3TrafficLights1"),
+                              type="percent", values=[0, 33, 67][: 3] if int(directive.get("icons") or 3) == 3
+                              else ([0, 25, 50, 75] if int(directive.get("icons") or 3) == 4
+                                    else [0, 20, 40, 60, 80]))
+        elif rule == "formula":
+            template = directive.get("formula") or ""
+            # {Col} -> $<L>2 (absolute column, relative row — the CF idiom: Excel walks
+            # the rule down the range); {Col:} -> the absolute data range.
+            def cf_ref(m):
+                text = m.group(1).strip()
+                is_range = text.endswith(":")
+                if is_range:
+                    text = text[:-1].strip()
+                if text not in columns:
+                    return m.group(0)
+                L = get_column_letter(columns.index(text) + 1)
+                return f"${L}$2:${L}${last}" if is_range else f"${L}2"
+            excel_formula = _PLACEHOLDER.sub(cf_ref, template)
+            if "{" in excel_formula:  # an unresolved reference — skip rather than break the file
+                continue
+            obj = FormulaRule(formula=[excel_formula], fill=fill, font=font)
+        if obj is not None:
+            ws.conditional_formatting.add(rng, obj)
+
+
+def _apply_comments(ws, df, directive: dict, offset: int = 0) -> None:
+    """Attach explain-changes NOTES to cells (Phase 1.9). Values are untouched —
+    openpyxl Comment objects only. `offset` accounts for a Phase-1.4 title row (this
+    runs after layout because insert_rows doesn't move comment anchors)."""
+    from openpyxl.comments import Comment
+
+    columns = [str(c) for c in df.columns]
+    for cell_spec in directive.get("cells") or []:
+        col = cell_spec.get("column")
+        if col not in columns:
+            continue
+        row = int(cell_spec.get("row") or 0) + offset
+        if row < 1:
+            continue
+        c = ws.cell(row=row, column=columns.index(col) + 1)
+        c.comment = Comment(f"Sumio: {cell_spec.get('text') or ''}", "Sumio", height=80, width=260)
+    if directive.get("summary"):
+        a1 = ws.cell(row=1, column=1)
+        a1.comment = Comment(f"Sumio — what changed:\n{directive['summary']}", "Sumio",
+                             height=140, width=320)
+
+
+def _apply_table(ws, df, directive: dict) -> None:
+    """Turn a 'table' directive into a native Excel Table (Phase 1.7): banded rows,
+    header filters, chosen style, and a live =SUBTOTAL() totals row. Re-running
+    REPLACES any table that overlaps or shares the name instead of corrupting the file."""
+    from openpyxl.worksheet.table import Table, TableColumn, TableStyleInfo
+
+    columns = [str(c) for c in df.columns]
+    if not columns or len(df) == 0:
+        return
+    totals: dict = directive.get("totals") or {}
+    name = directive.get("name") or "SumioTable"
+    last_col = get_column_letter(len(columns))
+    last_data_row = len(df) + 1
+    ref = f"A1:{last_col}{last_data_row + (1 if totals else 0)}"
+
+    # Replace, never duplicate: drop tables that share the name or overlap our range.
+    for existing in list(ws.tables.values()):
+        if existing.displayName == name or str(existing.ref).split(":")[0] == "A1":
+            del ws.tables[existing.displayName]
+    while name in ws.parent.defined_names or any(name in s.tables for s in ws.parent.worksheets):
+        name = name + "_2"
+
+    tcols = []
+    for i, col in enumerate(columns, start=1):
+        kwargs = {"id": i, "name": col}
+        spec = totals.get(col)
+        if spec:
+            kwargs["totalsRowFunction"] = spec["agg"] if spec["agg"] != "average" else "average"
+        elif totals and i == 1:
+            kwargs["totalsRowLabel"] = "Total"
+        tcols.append(TableColumn(**kwargs))
+
+    table = Table(displayName=name, ref=ref, tableColumns=tcols)
+    if totals:
+        table.totalsRowCount = 1
+        table.totalsRowShown = True
+        trow = last_data_row + 1
+        for i, col in enumerate(columns, start=1):
+            spec = totals.get(col)
+            cell = ws.cell(row=trow, column=i)
+            if spec:
+                letter = get_column_letter(i)
+                cell.value = f"=SUBTOTAL({spec['code']},{letter}2:{letter}{last_data_row})"
+            elif i == 1:
+                cell.value = "Total"
+    table.tableStyleInfo = TableStyleInfo(
+        name=directive.get("style") or "TableStyleMedium2",
+        showRowStripes=True, showColumnStripes=False,
+        showFirstColumn=False, showLastColumn=False,
+    )
+    ws.add_table(table)
+
+
+def _apply_dv(writer, ws, df, directive: dict) -> None:
+    """Turn a 'dv' directive into a real openpyxl DataValidation (Phase 1.5). Long or
+    comma-containing dropdown lists go on a hidden helper sheet (Excel's inline list
+    syntax caps at 255 chars and splits on commas)."""
+    from openpyxl.worksheet.datavalidation import DataValidation
+
+    columns = list(df.columns)
+    vtype = directive.get("validation_type")
+    min_v, max_v = directive.get("min_value"), directive.get("max_value")
+    last = len(df) + 1
+
+    kwargs: dict = {"allow_blank": bool(directive.get("allow_blank", True))}
+    if vtype == "list":
+        allowed = directive.get("allowed_values") or []
+        inline = ",".join(allowed)
+        if len(inline) <= 250 and not any("," in v for v in allowed):
+            kwargs.update(type="list", formula1=f'"{inline}"')
+        else:
+            # Helper sheet with one option per row, hidden, referenced by range.
+            name = _safe_sheet_name("Options", set(writer.book.sheetnames))
+            opts = writer.book.create_sheet(name)
+            for i, v in enumerate(allowed, start=1):
+                opts.cell(row=i, column=1, value=v)
+            opts.sheet_state = "hidden"
+            writer.sheets[name] = opts
+            kwargs.update(type="list", formula1=f"={_excel_sheet_ref(name)}!$A$1:$A${len(allowed)}")
+    elif vtype in ("whole", "decimal"):
+        kwargs["type"] = vtype
+        if min_v is not None and max_v is not None:
+            kwargs.update(operator="between", formula1=str(min_v), formula2=str(max_v))
+        elif min_v is not None:
+            kwargs.update(operator="greaterThanOrEqual", formula1=str(min_v))
+        else:
+            kwargs.update(operator="lessThanOrEqual", formula1=str(max_v))
+    elif vtype == "date":
+        def dfx(v):
+            d = pd.to_datetime(str(v))
+            return f"DATE({d.year},{d.month},{d.day})"
+        kwargs["type"] = "date"
+        if min_v is not None and max_v is not None:
+            kwargs.update(operator="between", formula1=dfx(min_v), formula2=dfx(max_v))
+        elif min_v is not None:
+            kwargs.update(operator="greaterThanOrEqual", formula1=dfx(min_v))
+        else:
+            kwargs.update(operator="lessThanOrEqual", formula1=dfx(max_v))
+    elif vtype == "text_length":
+        kwargs["type"] = "textLength"
+        if min_v is not None and max_v is not None:
+            kwargs.update(operator="between", formula1=str(int(min_v)), formula2=str(int(max_v)))
+        elif min_v is not None:
+            kwargs.update(operator="greaterThanOrEqual", formula1=str(int(min_v)))
+        else:
+            kwargs.update(operator="lessThanOrEqual", formula1=str(int(max_v)))
+    elif vtype == "custom":
+        template = directive.get("formula") or ""
+
+        def dv_ref(m):
+            text = m.group(1).strip()
+            is_range = text.endswith(":")
+            if is_range:
+                text = text[:-1].strip()
+            if text not in columns:
+                return m.group(0)
+            letter = get_column_letter(columns.index(text) + 1)
+            return f"${letter}$2:${letter}${last}" if is_range else f"${letter}2"
+        excel_formula = _PLACEHOLDER.sub(dv_ref, template)
+        if "{" in excel_formula:
+            return  # unresolved reference — keep the file clean rather than broken
+        kwargs.update(type="custom", formula1=excel_formula)
+    else:
+        return
+
+    dv = DataValidation(**kwargs)
+    dv.showInputMessage = True
+    dv.showErrorMessage = True
+    if directive.get("input_message"):
+        dv.promptTitle = "Sumio"
+        dv.prompt = directive["input_message"][:255]
+    if directive.get("error_message"):
+        dv.errorTitle = "Not allowed"
+        dv.error = directive["error_message"][:255]
+    for col in directive.get("columns") or []:
+        if col not in columns:
+            continue
+        letter = get_column_letter(columns.index(col) + 1)
+        dv.add(f"{letter}2:{letter}{last}")
+    ws.add_data_validation(dv)
+
+
+def _shift_sqref_down(sqref: str, by: int) -> str:
+    """'E2:E201 A5' -> 'E3:E202 A6' (used when a title row is inserted)."""
+    return re.sub(r"(\d+)", lambda m: str(int(m.group(1)) + by), sqref)
+
+
+def _apply_layout(ws, df, directive: dict) -> None:
+    """Apply a 'layout' directive (Phase 1.4). Runs AFTER all other directives (see
+    _apply_render): inserting the title row must shift already-written live formulas
+    (openpyxl Translator) and conditional-formatting rules down with the data."""
+    from openpyxl.formatting.formatting import ConditionalFormattingList
+    from openpyxl.formula.translate import Translator
+    from openpyxl.styles import Border, Side
+
+    from .operations.conditional_format import COLORS as _CF_COLORS
+
+    columns = list(df.columns)
+    ncols = max(1, len(columns))
+    offset = 0
+
+    if directive.get("title"):
+        ws.insert_rows(1)
+        offset = 1
+        # Live formulas were written for data-at-row-2 — walk them one row down.
+        for row in ws.iter_rows(min_row=2):
+            for cell in row:
+                if isinstance(cell.value, str) and cell.value.startswith("="):
+                    here = f"{cell.column_letter}{cell.row}"
+                    was = f"{cell.column_letter}{cell.row - 1}"
+                    try:
+                        cell.value = Translator(cell.value, origin=was).translate_formula(here)
+                    except Exception:
+                        pass  # leave the formula as-is rather than corrupt it
+        # Conditional-formatting ranges (and their row-anchored formulas) shift too.
+        old = [(str(cf.sqref), list(cf.rules)) for cf in ws.conditional_formatting]
+        ws.conditional_formatting = ConditionalFormattingList()
+        for sqref, rules in old:
+            for rule in rules:
+                if getattr(rule, "formula", None):
+                    try:
+                        rule.formula = [
+                            Translator("=" + f, origin="A1").translate_formula("A2")[1:]
+                            for f in rule.formula
+                        ]
+                    except Exception:
+                        pass
+                ws.conditional_formatting.add(_shift_sqref_down(sqref, 1), rule)
+        # Native Excel Tables shift their whole ref down with the data.
+        for tname in list(ws.tables):
+            ws.tables[tname].ref = _shift_sqref_down(str(ws.tables[tname].ref), 1)
+        # Defined names anchored to THIS sheet shift their absolute rows too.
+        for dn_name in list(ws.parent.defined_names):
+            dn = ws.parent.defined_names[dn_name]
+            if dn.attr_text and ws.title in str(dn.attr_text):
+                dn.attr_text = _shift_sqref_down(str(dn.attr_text), 1)
+        # Data-validation ranges (and any row-relative custom formulas) shift too.
+        for dv in list(ws.data_validations.dataValidation):
+            dv.sqref = _shift_sqref_down(str(dv.sqref), 1)
+            for attr in ("formula1", "formula2"):
+                f = getattr(dv, attr, None)
+                if isinstance(f, str) and f and not f.startswith('"') and "!" not in f:
+                    try:
+                        setattr(dv, attr, Translator("=" + f, origin="A1").translate_formula("A2")[1:])
+                    except Exception:
+                        pass
+        last_col = get_column_letter(ncols)
+        ws.merge_cells(f"A1:{last_col}1")
+        tcell = ws["A1"]
+        tcell.value = directive["title"]
+        tcell.font = Font(bold=True, size=14)
+        tcell.alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[1].height = 24
+
+    header_row = 1 + offset
+    first_data_row = 2 + offset
+    last_row = len(df) + 1 + offset
+
+    if directive.get("merge_range"):
+        ws.merge_cells(_shift_sqref_down(directive["merge_range"], offset))
+
+    if directive.get("header_fill"):
+        fill_hex, font_hex = _CF_COLORS.get(directive["header_fill"], _CF_COLORS["blue"])
+        fill = PatternFill(start_color=fill_hex, end_color=fill_hex, fill_type="solid")
+        for c in range(1, ncols + 1):
+            cell = ws.cell(row=header_row, column=c)
+            cell.fill = fill
+            cell.font = Font(bold=True, color=font_hex)
+
+    if directive.get("borders"):
+        thin = Side(style="thin", color="B0B0B0")
+        if directive["borders"] == "all":
+            box = Border(left=thin, right=thin, top=thin, bottom=thin)
+            for row in ws.iter_rows(min_row=header_row, max_row=last_row, min_col=1, max_col=ncols):
+                for cell in row:
+                    cell.border = box
+        else:  # outline: box around the used range only
+            for r in range(header_row, last_row + 1):
+                for c in range(1, ncols + 1):
+                    edges = {}
+                    if r == header_row:
+                        edges["top"] = thin
+                    if r == last_row:
+                        edges["bottom"] = thin
+                    if c == 1:
+                        edges["left"] = thin
+                    if c == ncols:
+                        edges["right"] = thin
+                    if edges:
+                        cell = ws.cell(row=r, column=c)
+                        old_border = cell.border
+                        cell.border = Border(
+                            left=edges.get("left", old_border.left),
+                            right=edges.get("right", old_border.right),
+                            top=edges.get("top", old_border.top),
+                            bottom=edges.get("bottom", old_border.bottom),
+                        )
+
+    if directive.get("autofit"):
+        # openpyxl has no real autofit — compute a good width from the content: the
+        # header, and the widest of a sample of values (capped so one novel doesn't
+        # blow the layout).
+        for i, col in enumerate(columns):
+            s = df[col].astype("string").fillna("")
+            sample = s.iloc[:500]
+            widest = int(sample.map(len).max() or 0) if len(sample) else 0
+            width = min(60, max(len(str(col)), widest) + 2)
+            ws.column_dimensions[get_column_letter(i + 1)].width = width
+
+    if directive.get("freeze"):
+        freeze = directive["freeze"]
+        anchor = {
+            "header": f"A{first_data_row}",
+            "first_column": "B1",
+            "both": f"B{first_data_row}",
+        }.get(freeze)
+        if anchor is None:  # explicit cell — shift with the title like everything else
+            anchor = _shift_sqref_down(freeze.upper(), offset)
+        ws.freeze_panes = anchor
+
+    if directive.get("print"):
+        _apply_print_setup(ws, directive["print"], offset, header_row)
+
+
+def _apply_print_setup(ws, ps: dict, offset: int, header_row: int) -> None:
+    """Phase 2.7 — page/print setup on the saved sheet. Display-only: never touches the
+    data. `offset` (1 if a title row was inserted) keeps the print area / repeat rows
+    aligned with the shifted data."""
+    from openpyxl.worksheet.page import PageMargins
+    from openpyxl.worksheet.properties import PageSetupProperties
+
+    if ps.get("orientation") in ("landscape", "portrait"):
+        ws.page_setup.orientation = ps["orientation"]
+    if ps.get("fit_wide"):
+        ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+        ws.page_setup.fitToWidth = int(ps["fit_wide"])
+        ws.page_setup.fitToHeight = 0  # 0 = however many pages tall it needs
+    if ps.get("print_area"):
+        ws.print_area = _shift_sqref_down(ps["print_area"], offset)
+    if ps.get("repeat_header"):
+        # Repeat everything from row 1 through the header row (includes a title if present).
+        ws.print_title_rows = f"1:{header_row}"
+    if ps.get("margins"):
+        preset = {
+            "narrow": dict(left=0.25, right=0.25, top=0.75, bottom=0.75, header=0.3, footer=0.3),
+            "wide": dict(left=1.0, right=1.0, top=1.0, bottom=1.0, header=0.5, footer=0.5),
+            "normal": dict(left=0.7, right=0.7, top=0.75, bottom=0.75, header=0.3, footer=0.3),
+        }.get(ps["margins"])
+        if preset:
+            ws.page_margins = PageMargins(**preset)
+    if ps.get("header_text"):
+        ws.oddHeader.center.text = ps["header_text"]
+    if ps.get("footer_text"):
+        ws.oddFooter.center.text = ps["footer_text"]
+
+
+def _apply_sheet_protect(writer, directive: dict) -> None:
+    """Phase 2.8 — lock/unlock a sheet's cells via openpyxl sheet protection. PASSWORD-LESS
+    by design: Sumio never sets or stores an open/file password (that's user-driven). Any
+    'allow editing' columns are unlocked before protection is turned on (all cells are
+    locked by default, so protecting the sheet freezes everything except those)."""
+    from openpyxl.styles import Protection
+
+    real = _resolve_sheet_name(writer.sheets.keys(), directive.get("sheet_name") or "")
+    if real is None:
+        return
+    ws = writer.sheets[real]
+    if not directive.get("protect"):
+        ws.protection.sheet = False
+        return
+    allow = {str(c).strip().lower() for c in (directive.get("allow_columns") or [])}
+    if allow and ws.max_row >= 1:
+        header = {str(ws.cell(row=1, column=c).value).strip().lower(): c
+                  for c in range(1, ws.max_column + 1)}
+        idxs = [header[a] for a in allow if a in header]
+        for r in range(2, ws.max_row + 1):
+            for ci in idxs:
+                ws.cell(row=r, column=ci).protection = Protection(locked=False)
+    ws.protection.sheet = True
 
 
 def _apply_highlight(ws, df, directive: dict) -> None:
@@ -1839,6 +2869,16 @@ def _number_format_code(fmt: str, decimals, symbol, date_format=None) -> str:
     dec = "." + "0" * d if d > 0 else ""
     if fmt == "currency":
         return f'"{symbol or "₹"}"#,##0{dec}'
+    if fmt in ("indian_currency", "indian", "lakh", "crore"):
+        # Indian digit grouping (12,34,56,789) via conditional sections — the lakh/crore
+        # comma pattern Excel can't produce with plain #,##0. (True unit SCALING to
+        # lakhs/crores needs a divided column — a format code can only scale by 1000s.)
+        sym = f'"{symbol or "₹"}"'
+        return (
+            f"[>=10000000]{sym}#\\,##\\,##\\,##\\,##0{dec};"
+            f"[>=100000]{sym}#\\,##\\,##\\,##0{dec};"
+            f"{sym}#,##0{dec}"
+        )
     if fmt == "percent":
         return f"0{dec}%"
     if fmt == "number":
@@ -1998,6 +3038,21 @@ async def workspace_reject(
 ) -> JSONResponse:
     try:
         result = collab.reject_change(ws_id, user_id, change_id, reason)
+        outcome = result.pop("status")
+        return JSONResponse({"status": "ok", "outcome": outcome, **result, "workspace": _collab_state(ws_id)})
+    except collab.CollabError as exc:
+        return _collab_error(exc)
+
+
+@app.post("/workspace/{ws_id}/withdraw")
+async def workspace_withdraw(
+    ws_id: str,
+    user_id: str = Form(...),
+    change_id: str = Form(...),
+) -> JSONResponse:
+    """The proposer (or an owner) cancels their own pending change — no approver needed."""
+    try:
+        result = collab.withdraw_change(ws_id, user_id, change_id)
         outcome = result.pop("status")
         return JSONResponse({"status": "ok", "outcome": outcome, **result, "workspace": _collab_state(ws_id)})
     except collab.CollabError as exc:
@@ -2482,17 +3537,28 @@ async def _json(request: Request) -> dict:
 async def quality_snapshot(
     session_id: str = Form(...),
     max_age_hours: float = Form(24.0),
+    set_baseline: str = Form("false"),
 ) -> JSONResponse:
     """Observability snapshot of the session's current data: a profile (columns/types,
-    blank rates), an accurate 'last updated', and a staleness flag."""
+    blank rates), an accurate 'last updated', and a staleness flag.
+
+    With set_baseline=true, the current data ALSO becomes the new quality baseline — so
+    after a deliberate schema change the user can re-baseline and stop /quality/check from
+    alarming forever against the original upload (which would otherwise train them to
+    ignore alarms — the opposite of the 'low false alarms' goal). Re-baselining resets the
+    schema/blank reference only; it does NOT touch 'last updated' (freshness stays honest)."""
     entry = _SESSIONS.get(session_id) if session_id else None
     if not entry or not entry.get("states"):
         return _error("Upload a spreadsheet first.", status=400)
     prof = quality.profile(entry["states"][-1]["tables"])
+    baseline_set = str(set_baseline).strip().lower() in ("1", "true", "yes")
+    if baseline_set:
+        entry["quality_baseline"] = {"profile": prof, "captured_at": time.time()}
     updated_at = entry.get("updated_at", time.time())
     stale = quality.staleness(updated_at, time.time(), max_age_hours * 3600)
     return JSONResponse({
         "status": "ok", "profile": prof, "last_updated": updated_at, "staleness": stale,
+        "baseline_set": baseline_set,
     })
 
 
@@ -2620,6 +3686,7 @@ async def sheets_plan(request: Request) -> JSONResponse:
     values = body.get("values") or []
     sheet_name = body.get("sheet_name") or "Sheet1"
     team_id = body.get("team_id") or "default"
+    org_id = body.get("org_id") or ""  # Phase 5.2: shared org glossary
     history = body.get("history") or ""
     can_edit = bool(body.get("can_edit", True))
     if not instruction:
@@ -2632,14 +3699,14 @@ async def sheets_plan(request: Request) -> JSONResponse:
     tables = {sheet_name: df}
     structure = summarize_tables(tables, sheet_name)
     structure, shielded = pii.redact_structure(structure, pii.scan_tables(tables))
-    glossary = personalization.context(team_id)
+    glossary = personalization.context(team_id, scope=org_id or None)
     safe_history = pii.redact_text(history)
     context = (glossary + "\n\n" + safe_history).strip() if glossary else safe_history
 
     try:
         plan = llm.parse_instruction(instruction, structure, context)
     except Exception as exc:
-        plan = fallback.parse(instruction, structure, personalization.definitions(team_id))
+        plan = fallback.parse(instruction, structure, personalization.effective_definitions(team_id, org_id or None))
         if plan is None:
             unavailable = isinstance(exc, llm.ModelUnavailableError)
             return _error(
@@ -2661,6 +3728,11 @@ async def sheets_plan(request: Request) -> JSONResponse:
         })
 
     operations = personalization.apply_preferences(operations, personalization.preferences(team_id))
+    phantom = _missing_columns(operations, tables)
+    if phantom:
+        return JSONResponse(
+            {"status": "clarify", "clarification": _missing_columns_clarification(phantom, tables)}
+        )
     translation = (plan.get("translation") or "").strip() or _describe_plan(operations)
     confidence = plan.get("confidence")
     if not isinstance(confidence, int) or not (0 <= confidence <= 100):
@@ -3007,6 +4079,32 @@ async def memory_delete_definition(term: str = Form(...), team_id: str = Form("d
     return JSONResponse({"status": "ok", "removed": removed, "memory": personalization.get_memory(team_id)})
 
 
+# Shared / org-wide AI memory (Phase 5.2) — a glossary every team in an org inherits.
+@app.get("/memory/shared")
+async def memory_shared_get(org_id: str = "") -> JSONResponse:
+    return JSONResponse({"status": "ok", "shared": personalization.get_shared_memory(org_id)})
+
+
+@app.post("/memory/shared/definition")
+async def memory_set_shared_definition(
+    org_id: str = Form(...),
+    term: str = Form(...),
+    definition: str = Form(""),
+    formula: str = Form(""),
+) -> JSONResponse:
+    try:
+        item = personalization.set_shared_definition(org_id, term, definition, formula or None)
+    except ValueError as exc:
+        return _error(str(exc), status=400)
+    return JSONResponse({"status": "ok", "definition": item, "shared": personalization.get_shared_memory(org_id)})
+
+
+@app.post("/memory/shared/definition/delete")
+async def memory_delete_shared_definition(org_id: str = Form(...), term: str = Form(...)) -> JSONResponse:
+    removed = personalization.delete_shared_definition(org_id, term)
+    return JSONResponse({"status": "ok", "removed": removed, "shared": personalization.get_shared_memory(org_id)})
+
+
 @app.post("/memory/preferences")
 async def memory_set_preferences(
     currency_symbol: str = Form(None),
@@ -3029,6 +4127,15 @@ async def memory_set_preferences(
         prefs["bold_header"] = str(bold_header).strip().lower() in ("1", "true", "yes")
     personalization.set_preferences(team_id, **prefs)
     return JSONResponse({"status": "ok", "memory": personalization.get_memory(team_id)})
+
+
+@app.post("/memory/preferences/delete")
+async def memory_delete_preference(key: str = Form(...), team_id: str = Form("default")) -> JSONResponse:
+    """Delete ONE remembered preference by key (currency_symbol/date_format/decimals/
+    bold_header), so users can fully manage — view, edit, AND delete — every kind of
+    memory, not just definitions and templates (Phase 3.7)."""
+    removed = personalization.clear_preference(team_id, key)
+    return JSONResponse({"status": "ok", "removed": removed, "memory": personalization.get_memory(team_id)})
 
 
 @app.post("/memory/template")
@@ -3054,16 +4161,609 @@ async def memory_delete_template(name: str = Form(...), team_id: str = Form("def
     return JSONResponse({"status": "ok", "removed": removed, "memory": personalization.get_memory(team_id)})
 
 
+# --------------------------------------------------------------------------- #
+# Workflow / automation builder (Phase 4.9) — save a pipeline of operations with a
+# trigger, run it with per-step status, and let a scheduler tick find what's due.
+# --------------------------------------------------------------------------- #
+def _workflow_error(exc: "workflow.WorkflowError") -> JSONResponse:
+    return _error(str(exc), status=exc.status)
+
+
+@app.post("/workflow/create")
+async def workflow_create(
+    name: str = Form(...),
+    steps: str = Form(...),
+    trigger: str = Form(""),
+) -> JSONResponse:
+    """Save a pipeline: `steps` is an Operation Plan (JSON list, or {"operations":[…]}),
+    `trigger` is optional JSON {type: manual|schedule|new_file|anomaly, …}."""
+    try:
+        parsed = json.loads(steps)
+        ops = parsed.get("operations") if isinstance(parsed, dict) else parsed
+        trig = json.loads(trigger) if trigger.strip() else None
+        wf = workflow.create_workflow(name, ops, trig)
+    except (ValueError, json.JSONDecodeError) as exc:
+        return _error(str(exc) or "Invalid workflow.", status=400)
+    except workflow.WorkflowError as exc:
+        return _workflow_error(exc)
+    return JSONResponse({"status": "ok", "workflow": workflow._public(wf)})
+
+
+@app.get("/workflow/list")
+async def workflow_list() -> JSONResponse:
+    return JSONResponse({"status": "ok", "workflows": workflow.list_workflows()})
+
+
+@app.get("/workflow/{workflow_id}")
+async def workflow_get(workflow_id: str) -> JSONResponse:
+    try:
+        wf = workflow.get_workflow(workflow_id)
+    except workflow.WorkflowError as exc:
+        return _workflow_error(exc)
+    return JSONResponse({"status": "ok", "workflow": workflow._public(wf), "steps": wf["steps"]})
+
+
+@app.post("/workflow/{workflow_id}/pause")
+async def workflow_pause(workflow_id: str) -> JSONResponse:
+    try:
+        return JSONResponse({"status": "ok", "workflow": workflow.set_status(workflow_id, "paused")})
+    except workflow.WorkflowError as exc:
+        return _workflow_error(exc)
+
+
+@app.post("/workflow/{workflow_id}/resume")
+async def workflow_resume(workflow_id: str) -> JSONResponse:
+    try:
+        return JSONResponse({"status": "ok", "workflow": workflow.set_status(workflow_id, "active")})
+    except workflow.WorkflowError as exc:
+        return _workflow_error(exc)
+
+
+@app.post("/workflow/{workflow_id}/delete")
+async def workflow_delete(workflow_id: str) -> JSONResponse:
+    return JSONResponse({"status": "ok", "removed": workflow.delete_workflow(workflow_id)})
+
+
+@app.post("/workflow/{workflow_id}/run")
+async def workflow_run(workflow_id: str, session_id: str = Form(...)) -> JSONResponse:
+    """Run a workflow's pipeline on the session's current data. Returns a per-step status
+    report; a failed step stops the pipeline cleanly (later steps 'skipped'), and the file
+    reflects the steps that completed. Trusted Hands execute — no model call."""
+    entry = _SESSIONS.get(session_id) if session_id else None
+    if not entry or not entry.get("states"):
+        return _error("Please upload a spreadsheet to start.", status=400)
+    base = entry["states"][-1]
+    try:
+        report, result, result_name = workflow.run_workflow(
+            workflow_id, base["tables"], base["primary"], execute_multi)
+    except workflow.WorkflowError as exc:
+        return _workflow_error(exc)
+    except Exception:
+        return _error(_INTERNAL_ERROR, status=500)
+
+    payload = {"status": "ok", **report}
+    # Offer the resulting file (reflecting the steps that completed) as a download.
+    try:
+        if isinstance(result, dict):
+            out_bytes, out_name, media_type = _serialize_workbook(result, result_name, primary=result_name)
+            payload["row_count"] = sum(int(len(d)) for d in result.values())
+        elif result is not None:
+            out_bytes, out_name, media_type = _serialize(result, result_name, base["exts"].get(result_name, "xlsx"), [])
+            payload["row_count"] = int(len(result))
+        else:
+            out_bytes = None
+        if out_bytes is not None:
+            payload["download_id"] = _store_result(out_bytes, out_name, media_type)
+            payload["filename"] = out_name
+    except Exception:
+        pass  # the report is the point; a serialization hiccup shouldn't fail the run
+    return JSONResponse(payload)
+
+
+@app.post("/workflow/run-due")
+async def workflow_run_due(event: str = Form("")) -> JSONResponse:
+    """Scheduler tick: given a trigger `event` (JSON {type, anomalies_found?}), return the
+    ACTIVE workflows that should fire now — schedule cadence elapsed, a new file arrived, or
+    a genuine anomaly was reported. The caller then runs each against its data source."""
+    try:
+        ev = json.loads(event) if event.strip() else {}
+    except (ValueError, json.JSONDecodeError):
+        return _error("Event must be JSON.", status=400)
+    due = workflow.due_workflows(ev)
+    return JSONResponse({"status": "ok", "due": [workflow._public(w) for w in due], "count": len(due)})
+
+
+# --------------------------------------------------------------------------- #
+# Data lineage (Phase 5.3) — trace a column's value back to its source columns, and a
+# whole-workbook dependency graph, from the session's formula registry (Phase 4.8).
+# --------------------------------------------------------------------------- #
+def _session_columns(base: dict) -> set[str]:
+    return {str(c) for df in base["tables"].values() for c in df.columns}
+
+
+@app.post("/lineage")
+async def lineage_column(session_id: str = Form(...), column: str = Form(...)) -> JSONResponse:
+    """Trace ONE column to its sources: a value→source tree (derived columns + their
+    formulas, down to source columns), plus the flat set of root sources it derives from."""
+    entry = _SESSIONS.get(session_id) if session_id else None
+    if not entry or not entry.get("states"):
+        return _error("Please upload a spreadsheet to start.", status=400)
+    base = entry["states"][-1]
+    cols = _session_columns(base)
+    formulas = entry.get("formulas") or {}
+    column = (column or "").strip()
+    if column not in cols and column not in formulas:
+        return _error(f"There's no column called '{column}' in this workbook.", status=404)
+    return JSONResponse({
+        "status": "ok",
+        "column": column,
+        "derived": column in formulas,
+        "trace": lineage.trace(column, formulas, cols),
+        "sources": lineage.source_columns(column, formulas),
+    })
+
+
+@app.post("/lineage/graph")
+async def lineage_workbook_graph(session_id: str = Form(...)) -> JSONResponse:
+    """The whole-workbook lineage graph: nodes (columns, tagged source/derived) and edges
+    (source → derived) for a visual dependency view."""
+    entry = _SESSIONS.get(session_id) if session_id else None
+    if not entry or not entry.get("states"):
+        return _error("Please upload a spreadsheet to start.", status=400)
+    base = entry["states"][-1]
+    return JSONResponse({
+        "status": "ok",
+        "graph": lineage.graph(entry.get("formulas") or {}, _session_columns(base)),
+    })
+
+
+# --------------------------------------------------------------------------- #
+# Knowledge graph (Phase 5.4) — entities (sheets) + inferred relationships (foreign keys),
+# and relational queries without joins (name a related field, we resolve the join).
+# --------------------------------------------------------------------------- #
+@app.post("/kg/graph")
+async def kg_graph(session_id: str = Form(...)) -> JSONResponse:
+    """The workbook's knowledge graph: each sheet as an entity (columns + candidate keys),
+    plus the foreign-key relationships inferred between sheets."""
+    entry = _SESSIONS.get(session_id) if session_id else None
+    if not entry or not entry.get("states"):
+        return _error("Please upload a spreadsheet to start.", status=400)
+    return JSONResponse({"status": "ok", "graph": kg.graph(entry["states"][-1]["tables"])})
+
+
+@app.post("/kg/query")
+async def kg_query(
+    session_id: str = Form(...),
+    field: str = Form(...),
+    from_table: str = Form(""),
+) -> JSONResponse:
+    """Relational query without a join: bring `field` from a RELATED table into `from_table`
+    (default: the primary sheet). Sumio resolves the join keys from the knowledge graph and
+    runs the lookup; the result is previewed and offered as a file. Declines honestly (422)
+    when there's no relationship or the field is ambiguous."""
+    entry = _SESSIONS.get(session_id) if session_id else None
+    if not entry or not entry.get("states"):
+        return _error("Please upload a spreadsheet to start.", status=400)
+    base = entry["states"][-1]
+    tables, primary, exts = base["tables"], base["primary"], base["exts"]
+    start = (from_table or "").strip() or primary
+    try:
+        op, rel = kg.auto_lookup(tables, start, field.strip())
+    except ValueError as exc:
+        return _error(str(exc), status=422)
+    try:
+        result, result_name, notes, render_ops = execute_multi(tables, start, [op])
+    except OperationError as exc:
+        return _error(str(exc), status=422)
+    except Exception:
+        return _error(_INTERNAL_ERROR, status=500)
+
+    payload = {
+        "status": "ok",
+        "field": field.strip(),
+        "relationship": rel,  # from_table.from_column → to_table.to_column (+ coverage)
+        "explanation": (
+            f"Brought '{field.strip()}' from {rel['to_table']} into {start} by matching "
+            f"{start}.{rel['from_column']} → {rel['to_table']}.{rel['to_column']}."
+        ),
+        "notes": notes,
+        "preview": _result_preview(result, result_name),
+        "row_count": int(len(result)) if not isinstance(result, dict) else None,
+    }
+    try:  # offer the enriched table as a download (a KG query doesn't mutate session state)
+        out_bytes, out_name, media_type = _serialize(result, result_name, exts.get(result_name, "xlsx"), render_ops)
+        payload["download_id"] = _store_result(out_bytes, out_name, media_type)
+        payload["filename"] = out_name
+    except Exception:
+        pass
+    return JSONResponse(payload)
+
+
+# --------------------------------------------------------------------------- #
+# Security & compliance (Phase 5.5) — compliance profiles that widen the PII shield, a
+# compliance posture scan, and the security audit trail.
+# --------------------------------------------------------------------------- #
+@app.get("/compliance/profiles")
+async def compliance_profiles() -> JSONResponse:
+    """The compliance regimes the shield can enforce (for a UI toggle)."""
+    return JSONResponse({"status": "ok", "profiles": compliance.available()})
+
+
+@app.post("/compliance/scan")
+async def compliance_scan(
+    session_id: str = Form(...),
+    compliance_mode: str = Form(""),
+) -> JSONResponse:
+    """Report which fields are sensitive under the active compliance profiles (base PII plus
+    regime-specific hints), confirming they're masked before the AI. Recorded in the audit log."""
+    entry = _SESSIONS.get(session_id) if session_id else None
+    if not entry or not entry.get("states"):
+        return _error("Please upload a spreadsheet to start.", status=400)
+    tables = entry["states"][-1]["tables"]
+    rep = compliance.report(tables, compliance_mode)
+    audit.record("compliance_scan", actor=session_id,
+                 detail=f"Scanned under {len(rep['profiles'])} profile(s); {rep['sensitive_count']} sensitive field(s).",
+                 meta={"profiles": [p["id"] for p in rep["profiles"]], "sensitive_count": rep["sensitive_count"]})
+    return JSONResponse({"status": "ok", **rep})
+
+
+@app.get("/audit")
+async def audit_log(limit: int = 100, action: str = "") -> JSONResponse:
+    """The security audit trail, most-recent-first — what was shielded/scanned, and when."""
+    return JSONResponse({"status": "ok", "events": audit.events(limit=limit, action=action or None)})
+
+
+# --------------------------------------------------------------------------- #
+# User roles & range-level permissions (Phase 5.6).
+# --------------------------------------------------------------------------- #
+@app.get("/permissions/roles")
+async def permissions_roles() -> JSONResponse:
+    """The data-access roles and what each may do (for a role-picker UI)."""
+    return JSONResponse({"status": "ok", "roles": permissions.roles_summary()})
+
+
+@app.post("/permissions/authorize")
+async def permissions_authorize(
+    session_id: str = Form(...),
+    role: str = Form(...),
+    plan: str = Form(...),
+    grants: str = Form(""),
+) -> JSONResponse:
+    """Check whether `role` (with optional range `grants`) may run `plan` on the session's
+    data. Returns {allowed, blocked:[{step, action, reason}]} — a read-only role can change
+    nothing; an editor is checked per-column against its range grants."""
+    entry = _SESSIONS.get(session_id) if session_id else None
+    if not entry or not entry.get("states"):
+        return _error("Please upload a spreadsheet to start.", status=400)
+    if not permissions.is_role(role):
+        return _error(f"Unknown role '{role}'. Roles: {', '.join(permissions.ROLES)}.", status=400)
+    try:
+        parsed = json.loads(plan)
+        operations = parsed.get("operations") if isinstance(parsed, dict) else parsed
+        grant_list = json.loads(grants) if grants.strip() else []
+    except (ValueError, json.JSONDecodeError):
+        return _error("Plan and grants must be valid JSON.", status=400)
+    result = permissions.authorize_plan(role, operations or [], entry["states"][-1]["tables"], grant_list)
+    return JSONResponse({"status": "ok", "role": role, **result})
+
+
+# --------------------------------------------------------------------------- #
+# Self-healing workbooks (Phase 5.7) — detect formula references broken by a dropped/renamed
+# column and repair them (remap to a renamed column, or restore from version history).
+# --------------------------------------------------------------------------- #
+def _state_columns(state: dict) -> set[str]:
+    return {str(c) for df in state["tables"].values() for c in df.columns}
+
+
+def _heal_history(states: list) -> list:
+    """[(version_index, columns_set), …] for PAST versions, newest-first — what selfheal
+    searches to restore a dropped column from."""
+    return [(i, _state_columns(states[i])) for i in range(len(states) - 2, -1, -1)]
+
+
+@app.post("/heal")
+async def heal_diagnose(session_id: str = Form(...)) -> JSONResponse:
+    """Diagnose broken formula references and propose repairs (remap / restore / unrepairable)
+    — read-only; nothing is changed."""
+    entry = _SESSIONS.get(session_id) if session_id else None
+    if not entry or not entry.get("states"):
+        return _error("Please upload a spreadsheet to start.", status=400)
+    states = entry["states"]
+    formulas = entry.get("formulas") or {}
+    current_cols = _state_columns(states[-1])
+    broken = selfheal.broken_references(formulas, current_cols)
+    repairs = selfheal.plan_repairs(formulas, current_cols, _heal_history(states))
+    return JSONResponse({
+        "status": "ok",
+        "healthy": not broken,
+        "broken_references": broken,
+        "repairs": repairs,
+    })
+
+
+@app.post("/heal/apply")
+async def heal_apply(session_id: str = Form(...)) -> JSONResponse:
+    """Apply the repairs: restore dropped columns from history (when row counts still align),
+    remap renamed references and recompute those formula columns. Pushes a new version."""
+    entry = _SESSIONS.get(session_id) if session_id else None
+    if not entry or not entry.get("states"):
+        return _error("Please upload a spreadsheet to start.", status=400)
+    states = entry["states"]
+    current = states[-1]
+    tables, primary, exts = current["tables"], current["primary"], current["exts"]
+    formulas = entry.get("formulas") or {}
+    repairs = selfheal.plan_repairs(formulas, _state_columns(current), _heal_history(states))
+
+    healed: list[dict] = []
+    skipped: list[dict] = []
+    new_tables = {t: df.copy() for t, df in tables.items()}
+
+    # 1) RESTORE dropped columns from the version that still had them (positional, only when
+    #    the row count matches so we never re-attach misaligned data).
+    for r in [r for r in repairs if r["action"] == "restore"]:
+        src = states[r["from_version"]]
+        src_tbl = next((n for n, df in src["tables"].items() if r["column"] in df.columns), None)
+        if src_tbl is not None and len(src["tables"][src_tbl]) == len(new_tables[primary]):
+            new_tables[primary][r["column"]] = src["tables"][src_tbl][r["column"]].values
+            healed.append({**r, "result": "restored"})
+        else:
+            skipped.append({**r, "reason": "row count changed since then — can't safely restore."})
+
+    # 2) REMAP renamed references in the registry, then recompute those formula columns.
+    new_formulas, changed = selfheal.apply_remaps(formulas, repairs)
+    if changed:
+        ops = [{"action": "add_formula_column", "name": col, "formula": new_formulas[col], "overwrite": True}
+               for col in changed]
+        try:
+            result, result_name, _notes, _render = execute_multi(new_tables, primary, ops)
+            new_tables = result if isinstance(result, dict) else {result_name: result}
+            primary = result_name if not isinstance(result, dict) else next(iter(result))
+        except (OperationError, MultiStepError) as exc:
+            return _error(f"Couldn't recompute a healed formula: {exc}", status=422)
+        except Exception:
+            return _error(_INTERNAL_ERROR, status=500)
+        for r in [r for r in repairs if r["action"] == "remap"]:
+            healed.append({**r, "result": "remapped"})
+
+    unrepairable = [r for r in repairs if r["action"] == "unrepairable"]
+
+    # Commit the healed workbook as a new version (only if something changed).
+    if healed:
+        new_state = {"tables": new_tables, "primary": primary,
+                     "exts": {**exts, **{k: exts.get(k, "xlsx") for k in new_tables}},
+                     "label": f"Self-healed {len(healed)} broken reference(s)"}
+        _push_state(session_id, new_state)
+        entry["formulas"] = new_formulas
+        audit.record("self_heal", actor=session_id,
+                     detail=f"Repaired {len(healed)} reference(s); {len(skipped)+len(unrepairable)} unresolved.",
+                     meta={"healed": [r["missing"] for r in healed], "skipped": len(skipped)})
+
+    return JSONResponse({
+        "status": "ok",
+        "healed": healed,
+        "skipped": skipped + unrepairable,
+        "preview": _result_preview(new_tables[primary], primary),
+        "remaining_broken": selfheal.broken_references(entry.get("formulas") or {}, _state_columns(_SESSIONS[session_id]["states"][-1])),
+    })
+
+
+# --------------------------------------------------------------------------- #
+# Performance & scale (Phase 5.8) — a sampled preview for huge sheets, and result-cache stats.
+# --------------------------------------------------------------------------- #
+@app.post("/scale/preview")
+async def scale_preview(session_id: str = Form(...), sample_rows: int = Form(1000)) -> JSONResponse:
+    """A fast, representative preview of the session's current data. For a huge sheet it
+    previews an evenly-spaced SAMPLE (flagged as such) instead of scanning every row."""
+    entry = _SESSIONS.get(session_id) if session_id else None
+    if not entry or not entry.get("states"):
+        return _error("Please upload a spreadsheet to start.", status=400)
+    base = entry["states"][-1]
+    sample_rows = max(1, min(int(sample_rows or 1000), 50_000))
+    sampled_tables, was_sampled = scale.sample_tables(base["tables"], sample_rows)
+    frames = {n: sampled_tables[n] for n in sampled_tables}
+    preview = [
+        {"name": n, **{k: summarize_structure(df, sample_rows=min(8, len(df)))[k]
+                       for k in ("row_count", "columns", "sample_rows")}}
+        for n, df in frames.items()
+    ]
+    return JSONResponse({
+        "status": "ok",
+        "sampled": was_sampled,
+        "total_rows": scale.total_rows(base["tables"]),
+        "sample_rows": sample_rows if was_sampled else scale.total_rows(base["tables"]),
+        "large": scale.is_large(base["tables"]),
+        "preview": preview,
+    })
+
+
+@app.get("/scale/stats")
+async def scale_stats() -> JSONResponse:
+    """Result-cache statistics (entries, hits, misses, hit-rate) — how much recompute the
+    cache is saving."""
+    return JSONResponse({"status": "ok", "cache": scale.RESULT_CACHE.stats()})
+
+
+# --------------------------------------------------------------------------- #
+# Executive insight generator (Phase 5.9) — a board-ready narrative, every figure computed.
+# --------------------------------------------------------------------------- #
+@app.post("/executive/summary")
+async def executive_summary(session_id: str = Form(...), title: str = Form("")) -> JSONResponse:
+    """Compose a grounded executive summary of the session's current primary sheet: a
+    headline plus verifiable findings (each with its raw figures) and a plain-text rendering.
+    Every number is computed here — never model-generated — so nothing can be fabricated."""
+    entry = _SESSIONS.get(session_id) if session_id else None
+    if not entry or not entry.get("states"):
+        return _error("Please upload a spreadsheet to start.", status=400)
+    base = entry["states"][-1]
+    df = base["tables"].get(base["primary"])
+    summary = execsummary.generate(df, title=title or None)
+    return JSONResponse({"status": "ok", **summary, "text": execsummary.as_text(summary)})
+
+
+# --------------------------------------------------------------------------- #
+# Optimization / Solver (Phase 5.10) — constrained linear/integer optimization (scipy).
+# --------------------------------------------------------------------------- #
+@app.post("/solve")
+async def solve(problem: str = Form(...)) -> JSONResponse:
+    """Solve a constrained optimization: `problem` is JSON with objective / sense /
+    constraints / bounds / integer. Returns the TRUE outcome (optimal / infeasible /
+    unbounded) with the solution and objective value — never a fabricated result."""
+    try:
+        spec = json.loads(problem)
+    except (ValueError, json.JSONDecodeError):
+        return _error("The optimization problem must be valid JSON.", status=400)
+    if not isinstance(spec, dict):
+        return _error("The optimization problem must be a JSON object.", status=400)
+    try:
+        result = solver.solve_linear(
+            objective=spec.get("objective") or {},
+            constraints=spec.get("constraints") or [],
+            bounds=spec.get("bounds"),
+            sense=spec.get("sense", "max"),
+            integer=spec.get("integer"),
+        )
+    except solver.SolverError as exc:
+        return _error(str(exc), status=exc.status)
+    return JSONResponse({"status": "ok", **result})
+
+
+# --------------------------------------------------------------------------- #
+# Ecosystem (Phase 5.11) — plugin marketplace & custom agents (sandboxed), API platform,
+# admin console. A plugin is a validated pipeline of KNOWN operations, run through the same
+# trusted executor — never arbitrary code.
+# --------------------------------------------------------------------------- #
+def _mkt_error(exc: "marketplace.MarketplaceError") -> JSONResponse:
+    return _error(str(exc), status=exc.status)
+
+
+@app.post("/marketplace/publish")
+async def marketplace_publish(
+    name: str = Form(...),
+    steps: str = Form(...),
+    description: str = Form(""),
+    author: str = Form(""),
+    kind: str = Form("plugin"),
+) -> JSONResponse:
+    """Publish a plugin/agent: `steps` is an Operation Plan (JSON). It's sandbox-validated —
+    every step must be a known operation — before it's listed."""
+    try:
+        parsed = json.loads(steps)
+        ops = parsed.get("operations") if isinstance(parsed, dict) else parsed
+        plugin = marketplace.publish(name, ops, description, author, kind)
+    except (ValueError, json.JSONDecodeError) as exc:
+        return _error(str(exc) or "Invalid plugin.", status=400)
+    except marketplace.MarketplaceError as exc:
+        return _mkt_error(exc)
+    return JSONResponse({"status": "ok", "plugin": plugin})
+
+
+@app.get("/marketplace/list")
+async def marketplace_list() -> JSONResponse:
+    return JSONResponse({"status": "ok", "plugins": marketplace.listing()})
+
+
+@app.get("/marketplace/installed")
+async def marketplace_installed(team_id: str = "default") -> JSONResponse:
+    return JSONResponse({"status": "ok", "plugins": marketplace.installed(team_id)})
+
+
+@app.get("/marketplace/{plugin_id}")
+async def marketplace_get(plugin_id: str) -> JSONResponse:
+    try:
+        p = marketplace.get(plugin_id)
+    except marketplace.MarketplaceError as exc:
+        return _mkt_error(exc)
+    return JSONResponse({"status": "ok", "plugin": marketplace._public(p), "steps": p["steps"]})
+
+
+@app.post("/marketplace/{plugin_id}/install")
+async def marketplace_install(plugin_id: str, team_id: str = Form("default")) -> JSONResponse:
+    try:
+        marketplace.install(team_id, plugin_id)
+    except marketplace.MarketplaceError as exc:
+        return _mkt_error(exc)
+    return JSONResponse({"status": "ok", "installed": marketplace.installed(team_id)})
+
+
+@app.post("/marketplace/{plugin_id}/uninstall")
+async def marketplace_uninstall(plugin_id: str, team_id: str = Form("default")) -> JSONResponse:
+    return JSONResponse({"status": "ok", "removed": marketplace.uninstall(team_id, plugin_id)})
+
+
+@app.post("/marketplace/{plugin_id}/unpublish")
+async def marketplace_unpublish(plugin_id: str) -> JSONResponse:
+    return JSONResponse({"status": "ok", "removed": marketplace.unpublish(plugin_id)})
+
+
+@app.post("/marketplace/{plugin_id}/run")
+async def marketplace_run(plugin_id: str, session_id: str = Form(...)) -> JSONResponse:
+    """Run a plugin's sandboxed pipeline on the session's data — through the SAME trusted
+    executor as any instruction (caching, state history and all)."""
+    entry = _SESSIONS.get(session_id) if session_id else None
+    if not entry or not entry.get("states"):
+        return _error("Please upload a spreadsheet to start.", status=400)
+    try:
+        steps = marketplace.steps_of(plugin_id)
+        name = marketplace.get(plugin_id)["name"]
+    except marketplace.MarketplaceError as exc:
+        return _mkt_error(exc)
+    return _run_operations(session_id, entry["states"][-1], steps, name, time.time())
+
+
+# --- API platform: keys -----------------------------------------------------
+@app.post("/apikeys/issue")
+async def apikeys_issue(team_id: str = Form("default"), label: str = Form("")) -> JSONResponse:
+    """Issue an API key. The raw key is returned ONCE and never stored — save it now."""
+    return JSONResponse({"status": "ok", **apikeys.issue(team_id, label)})
+
+
+@app.get("/apikeys/list")
+async def apikeys_list(team_id: str = "default") -> JSONResponse:
+    return JSONResponse({"status": "ok", "keys": apikeys.list_keys(team_id)})
+
+
+@app.post("/apikeys/{key_id}/revoke")
+async def apikeys_revoke(key_id: str) -> JSONResponse:
+    return JSONResponse({"status": "ok", "revoked": apikeys.revoke(key_id)})
+
+
+# --- Admin console ----------------------------------------------------------
+@app.get("/admin/overview")
+async def admin_overview() -> JSONResponse:
+    """A lightweight admin snapshot of the ecosystem: plugins, active API keys, live sessions,
+    workflows, and recent audit activity."""
+    return JSONResponse({
+        "status": "ok",
+        "plugins": marketplace.count(),
+        "active_api_keys": apikeys.count(active_only=True),
+        "sessions": len(_SESSIONS),
+        "workflows": len(workflow.list_workflows()),
+        "audit_events": len(audit.events(limit=10_000)),
+    })
+
+
+def _step_label(notes: list[str]) -> str:
+    """A short, human-readable label for a version-history step, from the op notes
+    (Phase 3.2). E.g. 'Sorted by Price descending' or 'Filtered 200 → 96 rows'."""
+    text = " · ".join(n.strip().rstrip(".") for n in (notes or []) if n and n.strip())
+    return (text[:70] + "…") if len(text) > 70 else (text or "Changed the data")
+
+
 def _remember_session(session_id: str, state: dict) -> None:
     """Store a fresh session state, bounding both the number of sessions and the
     per-session undo stack so memory can't grow without limit. Also captures the data
     quality baseline + 'last updated' timestamp for observability (Phase 3.11)."""
     now = time.time()
+    state.setdefault("label", "Uploaded")  # the base version's label (Phase 3.2)
     _SESSIONS[session_id] = {
         "states": [state],
         "redo": [],
         "updated_at": now,
         "quality_baseline": {"profile": quality.profile(state["tables"]), "captured_at": now},
+        # Formula dependency registry (Phase 4.8): {column: formula} for every formula
+        # column Sumio has built this session — powers guardrails' "feeds N formulas"
+        # trace-precedents across steps. A fresh upload starts with none.
+        "formulas": {},
     }
     while len(_SESSIONS) > config.MAX_SESSIONS:
         _SESSIONS.pop(next(iter(_SESSIONS)))  # evict the oldest (dicts keep order)
@@ -3079,6 +4779,33 @@ def _push_state(session_id: str, state: dict) -> None:
         entry["states"] = [states[0]] + states[-(config.MAX_STATES - 1):]
     entry["redo"] = []  # a new forward step discards the redo branch (standard model)
     entry["updated_at"] = time.time()  # data changed → keep "last updated" accurate (3.11)
+
+
+def _record_formulas(session_id: str, operations: list[dict], result) -> None:
+    """Update the session's formula registry (Phase 4.8) after a successful run: remember
+    each add_formula_column {name: formula}, then prune to columns that still exist in the
+    result (a formula column later dropped/renamed stops being a live dependency). This is
+    the honest, session-scoped precedent graph guardrails traces for 'feeds N formulas'."""
+    entry = _SESSIONS.get(session_id)
+    if not entry:
+        return
+    reg = entry.setdefault("formulas", {})
+    for op in operations or []:
+        if op.get("action") == "add_formula_column":
+            name = (op.get("name") or "").strip()
+            formula = op.get("formula") or ""
+            if name and formula:
+                reg[name] = formula
+    live = set()
+    frames = result.values() if isinstance(result, dict) else [result]
+    for f in frames:
+        try:
+            live.update(str(c) for c in f.columns)
+        except Exception:
+            pass
+    for k in list(reg):
+        if k not in live:
+            reg.pop(k, None)
 
 
 def _error(message: str, status: int) -> JSONResponse:

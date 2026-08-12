@@ -27,3 +27,5 @@ google-auth==2.54.0
 # Postgres works via psycopg2-binary above; these add MySQL / Snowflake.
 # PyMySQL==1.1.1
 # snowflake-connector-python==3.12.3
+odfpy==1.4.1
+scipy==1.17.1
