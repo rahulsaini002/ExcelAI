@@ -310,6 +310,27 @@ def reject_change(ws_id: str, approver_id: str, change_id: str, reason: str = ""
     return {"status": "rejected", "change_id": change_id}
 
 
+def withdraw_change(ws_id: str, author_id: str, change_id: str) -> dict:
+    """The PROPOSER (or an owner) cancels their own pending change before it's decided — it
+    leaves the queue without ever touching the data. This gives the approval workflow a
+    'never mind' path that doesn't require an approver to reject your own no-longer-wanted
+    change. Withdrawn changes stay in the auditable decision trail (who withdrew, when)."""
+    ws = _get(ws_id)
+    _member(ws, author_id)  # must be a member of the workspace
+    change = _find_pending(ws, change_id)
+    if change["status"] != "pending":
+        raise CollabError(f"That change was already {change['status']}.", status=400)
+    is_owner = ws["members"].get(author_id, {}).get("role") == "owner"
+    if change["author"] != author_id and not is_owner:
+        raise CollabError(
+            "Only the person who proposed a change (or an owner) can withdraw it.", status=403
+        )
+    change["status"] = "withdrawn"
+    change["decided_by"] = author_id
+    change["decided_at"] = _now()
+    return {"status": "withdrawn", "change_id": change_id}
+
+
 def add_comment(ws_id: str, author_id: str, text: str, target=None) -> dict:
     """Attach a comment (optionally to a cell/column/row via free-form `target`)."""
     ws = _get(ws_id)
@@ -385,6 +406,18 @@ def state_summary(ws_id: str, table_summarizer=None) -> dict:
                 "status": c["status"], "created_at": c["created_at"],
             }
             for c in ws["pending"] if c["status"] == "pending"
+        ],
+        # Decision audit (Phase 5.1): every change that LEFT the queue — approved, rejected,
+        # or withdrawn — with who decided it and why. The `log` records what touched the
+        # DATA (applied changes only); this records the approval DECISIONS, so a rejection
+        # ("Bob's change declined by Alice: out of scope") is attributable, not invisible.
+        "decisions": [
+            {
+                "id": c["id"], "author": c["author"], "summary": c["summary"],
+                "status": c["status"], "decided_by": c.get("decided_by"),
+                "decided_at": c.get("decided_at"), "reason": c.get("reason"),
+            }
+            for c in ws["pending"] if c["status"] != "pending"
         ],
         "log": list(ws["log"]),
         "tables": tables,
