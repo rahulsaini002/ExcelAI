@@ -25,6 +25,17 @@ _MIN_RATE_INCREASE = 0.20   # blank rate must jump at least 20 percentage points
 _MIN_NEW_RATE = 0.10        # ...and end up at least 10% blank to matter
 _DEFAULT_MAX_AGE = 24 * 3600  # "stale" after a day by default
 
+# For SCHEMA-DRIFT comparison only, integer and float are the same numeric family: a
+# column merely gaining a decimal (10 → 10.5 on a refresh) is not a breaking change, and
+# alarming on it is a classic false positive. A genuine break (number → text) still fires.
+# This normalisation is local to quality diffing — `_friendly_dtype` stays granular
+# everywhere else (the Brain's structure summary still benefits from integer vs number).
+_NUMERIC_TYPES = {"integer", "number"}
+
+
+def _norm_type(t: str) -> str:
+    return "number" if t in _NUMERIC_TYPES else t
+
 
 def _blank_mask(series: pd.Series) -> pd.Series:
     return series.isna() | (series.astype(str).str.strip() == "")
@@ -56,7 +67,7 @@ def _schema_diff(old_cols: list[dict], new_cols: list[dict]) -> dict:
     type_changed = [
         {"column": c, "from": old_map[c], "to": new_map[c]}
         for c in new_map
-        if c in old_map and new_map[c] != old_map[c]
+        if c in old_map and _norm_type(new_map[c]) != _norm_type(old_map[c])
     ]
     return {"added": added, "removed": removed, "type_changed": type_changed}
 

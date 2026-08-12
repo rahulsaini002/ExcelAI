@@ -21,8 +21,16 @@ from pathlib import Path
 
 _MEMORY: dict[str, dict] = {}
 
+# Shared / org-wide AI memory (Phase 5.2): a glossary keyed by an ORG scope that MANY teams
+# inherit, so terminology ("our ARR", "Runway") is consistent across the whole organization
+# — not just within one team's private memory. A team's own definition of a term OVERRIDES
+# the shared one (local wins), so teams can still specialize. Kept in its own store + file so
+# it never disturbs the existing per-team memory.json format.
+_SHARED: dict[str, dict] = {}
+
 # Persisted so learning survives restarts. Tests set _PERSIST = False to stay off disk.
 _MEMORY_PATH = Path(__file__).resolve().parent.parent / "data" / "memory.json"
+_SHARED_PATH = Path(__file__).resolve().parent.parent / "data" / "shared_memory.json"
 _PERSIST = True
 
 
@@ -38,6 +46,14 @@ def _load() -> None:
         _MEMORY = {}
 
 
+def _load_shared() -> None:
+    global _SHARED
+    try:
+        _SHARED = json.loads(_SHARED_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        _SHARED = {}
+
+
 def _persist() -> None:
     if not _PERSIST:
         return
@@ -46,6 +62,16 @@ def _persist() -> None:
         _MEMORY_PATH.write_text(json.dumps(_MEMORY, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception:
         pass  # persistence is best-effort; never fail a request over it
+
+
+def _persist_shared() -> None:
+    if not _PERSIST:
+        return
+    try:
+        _SHARED_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _SHARED_PATH.write_text(json.dumps(_SHARED, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def _team(team_id: str) -> dict:
@@ -88,6 +114,61 @@ def definitions(team_id: str) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Shared / org-wide definitions (Phase 5.2)
+# --------------------------------------------------------------------------- #
+def _shared(scope: str) -> dict:
+    return _SHARED.setdefault((scope or "").strip(), {"definitions": {}})
+
+
+def set_shared_definition(scope: str, term: str, definition: str, formula: str | None = None) -> dict:
+    """Add/update an ORG-shared term every team in the org inherits."""
+    scope = (scope or "").strip()
+    if not scope:
+        raise ValueError("A shared definition needs an organization scope.")
+    term = (term or "").strip()
+    if not term:
+        raise ValueError("A definition needs a term.")
+    s = _shared(scope)
+    existing = s["definitions"].get(term, {})
+    s["definitions"][term] = {
+        "term": term,
+        "definition": (definition or "").strip(),
+        "formula": (formula or "").strip() or None,
+        "created_at": existing.get("created_at", _now()),
+        "updated_at": _now(),
+    }
+    _persist_shared()
+    return s["definitions"][term]
+
+
+def delete_shared_definition(scope: str, term: str) -> bool:
+    s = _shared(scope)
+    removed = s["definitions"].pop((term or "").strip(), None) is not None
+    if removed:
+        _persist_shared()
+    return removed
+
+
+def shared_definitions(scope: str) -> dict:
+    if not (scope or "").strip():
+        return {}
+    return dict(_shared(scope)["definitions"])
+
+
+def get_shared_memory(scope: str) -> dict:
+    return {"scope": (scope or "").strip(), "definitions": shared_definitions(scope)}
+
+
+def effective_definitions(team_id: str, scope: str | None = None) -> dict:
+    """Org-shared definitions (base) merged with the team's OWN (team overrides on a clash).
+    This is what the offline fallback expands, so org terms apply even when the model is
+    down — exactly like team terms do."""
+    merged = dict(shared_definitions(scope)) if scope else {}
+    merged.update(definitions(team_id))  # local team definition wins over the shared one
+    return merged
+
+
+# --------------------------------------------------------------------------- #
 # Preferences
 # --------------------------------------------------------------------------- #
 _PREF_KEYS = ("currency_symbol", "date_format", "decimals", "bold_header")
@@ -102,10 +183,15 @@ def set_preferences(team_id: str, **prefs) -> dict:
     return dict(t["preferences"])
 
 
-def clear_preference(team_id: str, key: str) -> None:
+def clear_preference(team_id: str, key: str) -> bool:
+    """Delete ONE remembered preference (e.g. drop the team's currency default). Returns
+    True if something was removed — completes view/edit/delete for preferences, matching
+    definitions and templates."""
     t = _team(team_id)
-    if t["preferences"].pop(key, None) is not None:
+    removed = t["preferences"].pop((key or "").strip(), None) is not None
+    if removed:
         _persist()
+    return removed
 
 
 def preferences(team_id: str) -> dict:
@@ -158,11 +244,26 @@ def get_memory(team_id: str) -> dict:
 # --------------------------------------------------------------------------- #
 # Application
 # --------------------------------------------------------------------------- #
-def context(team_id: str) -> str:
+def context(team_id: str, scope: str | None = None) -> str:
     """A glossary + preferences text block to inject into the parsing prompt, so learned
-    definitions are applied consistently. Empty when nothing is remembered."""
+    definitions are applied consistently. Empty when nothing is remembered.
+
+    When `scope` (an org) is given, an ORG glossary (Phase 5.2) is prepended so shared
+    terminology applies across teams; a team's own definition of the same term overrides the
+    shared one, so only the team's version is shown for a clash. With no scope, the output is
+    byte-identical to the team-only behaviour (backward compatible)."""
     t = _team(team_id)
     lines: list[str] = []
+    shared = shared_definitions(scope) if scope else {}
+    if shared:
+        team_terms = set(t["definitions"])
+        org_lines = [
+            f"- {d['term']}: {d['definition']}" + (f" (compute as {d['formula']})" if d.get("formula") else "")
+            for term, d in shared.items() if term not in team_terms  # team overrides shared
+        ]
+        if org_lines:
+            lines.append("Organization glossary — shared terms everyone should apply:")
+            lines.extend(org_lines)
     if t["definitions"]:
         lines.append("Team glossary — when the user uses these terms, apply these meanings:")
         for d in t["definitions"].values():
@@ -208,11 +309,12 @@ def apply_preferences(operations: list[dict], prefs: dict) -> list[dict]:
     return out
 
 
-def expand_definitions(instruction: str, team_id: str) -> list[dict] | None:
+def expand_definitions(instruction: str, team_id: str, scope: str | None = None) -> list[dict] | None:
     """Deterministic, offline expansion: 'add/create/calculate <term>' where <term> is a
-    defined formula → the team's add_formula_column. Used by the fallback parser so learned
-    definitions apply even when the model is unavailable. Returns ops or None."""
-    return _expand(instruction, definitions(team_id))
+    defined formula → an add_formula_column. Used by the fallback parser so learned
+    definitions apply even when the model is unavailable. Includes ORG-shared terms (Phase
+    5.2) when `scope` is given. Returns ops or None."""
+    return _expand(instruction, effective_definitions(team_id, scope))
 
 
 def _expand(instruction: str, defs: dict) -> list[dict] | None:
@@ -228,3 +330,4 @@ def _expand(instruction: str, defs: dict) -> list[dict] | None:
 
 
 _load()
+_load_shared()
