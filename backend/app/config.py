@@ -49,6 +49,21 @@ MAX_UPLOAD_MB = int(os.getenv("SUMIO_MAX_UPLOAD_MB", "250"))
 MAX_SESSIONS = int(os.getenv("SUMIO_MAX_SESSIONS", "200"))
 MAX_STATES = int(os.getenv("SUMIO_MAX_STATES", "30"))
 
+# Async execution jobs (Track 4 item 1).
+#   JOB_WORKERS         worker threads running plans off the event loop. Small on
+#                       purpose: the work is pandas/openpyxl (memory-hungry, and largely
+#                       GIL-bound outside numpy), so more threads mostly multiplies peak
+#                       memory rather than throughput. Raise only with real evidence.
+#   MAX_JOBS            cap on retained job RECORDS (tiny dicts). Running jobs are never
+#                       evicted; only finished ones are forgettable.
+#   MAX_JOB_RESULT_MB   byte budget for retained result BODIES, which are the big part (an
+#                       inline base64 workbook can be several MB). Past the budget the
+#                       oldest finished bodies are dropped but their receipt (download id,
+#                       filename, row count) is kept, so the file is still reachable.
+JOB_WORKERS = int(os.getenv("SUMIO_JOB_WORKERS", "2"))
+MAX_JOBS = int(os.getenv("SUMIO_MAX_JOBS", "100"))
+MAX_JOB_RESULT_MB = int(os.getenv("SUMIO_MAX_JOB_RESULT_MB", "64"))
+
 # Generated result files are written here so downloads (and "continue on the result")
 # survive a backend restart. Kept under MAX_RESULTS_MB and deleted after RESULTS_TTL_HOURS.
 import pathlib  # noqa: E402

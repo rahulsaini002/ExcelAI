@@ -216,12 +216,19 @@ def execute_multi(
     tables: dict[str, pd.DataFrame],
     primary: str,
     operations: list[dict],
+    on_step=None,
 ) -> tuple[pd.DataFrame, str, list[str], list[dict]]:
     """Apply operations across multiple named tables.
 
     A "working table" starts as `primary`. Each operation acts on the table named
     by its "table" field, or the working table if none is given; the result
     becomes the new working table. `merge` combines several tables into a new one.
+
+    `on_step(index0, action)` is an optional progress callback (Track 4 item 1), invoked
+    just BEFORE each step runs — so it fires only when a step is genuinely reached, never
+    on a timer. It is best-effort: any exception it raises is swallowed, because a broken
+    progress reporter must never be able to fail a real execution. Default None keeps the
+    signature backward-compatible for every existing caller.
 
     Returns (result_df, result_table_name, notes, format_ops).
     """
@@ -237,6 +244,12 @@ def execute_multi(
     aliases: dict[str, str] = {}  # name_range: plan-scoped {RangeName -> column}
 
     for step_idx, op in enumerate(operations):
+        if on_step is not None:
+            # Best-effort: a progress reporter that throws must not fail a real run.
+            try:
+                on_step(step_idx, (op or {}).get("action"))
+            except Exception:
+                pass
         try:
             # Named-range aliases: later formulas in the SAME plan may say {Prices:} —
             # substitute textually before the op runs.
