@@ -173,6 +173,42 @@ run("chart (Hinglish)", "Region ke hisaab se Revenue ka bar chart banao", S,
 run("dashboard (Hinglish)", "ek one-page dashboard banao Revenue ke summary ke saath", S,
     lambda p: ("dashboard" in actions(p), "expected dashboard"))
 
+# --- Urdu-SCRIPT variants of core operations (regional-script coverage) ----------
+run("sort desc (Urdu)", "Sales کو Price کے حساب سے زیادہ سے کم ترتیب دیں", S,
+    lambda p: (op_of(p, "sort").get("action") == "sort", "expected sort"))
+run("filter (Urdu)", "صرف وہ rows دکھائیں جہاں Region North ہے", S,
+    lambda p: ("filter" in actions(p), "expected filter"))
+run("aggregate (Urdu)", "Region کے حساب سے Revenue کا مجموعہ نکالیں", S,
+    lambda p: ("aggregate" in actions(p), "expected aggregate"))
+run("add_formula_column (Urdu)", "ایک Profit کالم شامل کریں جو Revenue منفی Cost ہو", S,
+    lambda p: ("add_formula_column" in actions(p), "expected add_formula_column"))
+run("remove_duplicates (Urdu)", "ڈپلیکیٹ rows ہٹا دیں", S,
+    lambda p: ("remove_duplicates" in actions(p), "expected remove_duplicates"))
+
+# --- Stage-2/3 operations (pivot / stats / charts / dashboard / print / protect / compare) ---
+run("pivot_summary (Hinglish)", "Region aur Name ke hisaab se total Revenue ki pivot table banao", S,
+    lambda p: ("pivot_summary" in actions(p) or "pivot" in actions(p), "expected pivot_summary"))
+run("statistics describe (Hinglish)", "Revenue aur Cost ke summary statistics do", S,
+    lambda p: ("statistics" in actions(p), "expected statistics"))
+run("statistics correlation (Devanagari)", "Revenue और Cost के बीच correlation क्या है?", S,
+    lambda p: ("statistics" in actions(p), "expected statistics"))
+run("moving_average (Hinglish)", "Revenue ka 2-row moving average column add karo", S,
+    lambda p: ("statistics" in actions(p) or "add_formula_column" in actions(p), "expected statistics/formula"))
+run("chart scatter (Hinglish)", "Cost aur Revenue ka scatter plot banao", S,
+    lambda p: ("chart" in actions(p), "expected chart"))
+run("chart doughnut (Urdu)", "Region کے حساب سے Revenue کا doughnut chart دکھائیں", S,
+    lambda p: ("chart" in actions(p), "expected chart"))
+run("unpivot (Urdu)", "Revenue اور Cost کالموں کو قطاروں میں تبدیل کریں", S,
+    lambda p: ("unpivot" in actions(p), "expected unpivot"))
+run("print setup (Hinglish)", "ise landscape mein ek page par print karo", S,
+    lambda p: ("layout_format" in actions(p), "expected layout_format with print"))
+run("protect (Urdu)", "اس sheet کو protect کریں تاکہ خانے غلطی سے edit نہ ہوں", S,
+    lambda p: ("sheet_op" in actions(p) and "protect" in str(op_of(p, "sheet_op").get("sheet_action") or ""),
+               "expected sheet_op protect"))
+run("compare (Hinglish)", "dono tables ke beech kya change hua?", S_TWO,
+    lambda p: ("sheet_op" in actions(p) and "compare" in str(op_of(p, "sheet_op").get("sheet_action") or ""),
+               "expected sheet_op compare"))
+
 print(f"\n{passed} passed, {failed} failed, {skipped} skipped (rate-limited/infra).")
 # Only real failures matter; skips just mean re-run when the model is free.
 raise SystemExit(1 if failed else 0)

@@ -94,16 +94,29 @@ except MultiStepError as e:
 client = TestClient(main.app)
 _orig = main.llm.parse_instruction
 try:
+    # Since Phase 0.3, a phantom column in ANY step is caught PRE-FLIGHT by the plan
+    # validator (clarify, nothing runs) — so the runtime partial-failure path is
+    # exercised with a step that only fails at execution time: arithmetic on text.
     main.llm.parse_instruction = lambda i, s, h: {"operations": [
         {"action": "remove_duplicates", "columns": ["Email"]},
         {"action": "sort", "columns": ["Ghost"], "orders": ["asc"]}]}
     r = client.post("/process",
-                    data={"instruction": "dedupe then sort by ghost", "session_id": "ms", "rewind": "-1", "history": ""},
+                    data={"instruction": "dedupe then sort by ghost", "session_id": "ms0", "rewind": "-1", "history": ""},
+                    files=[("files", ("t.csv", b"Email\na@x\na@x\nb@x\n", "text/csv"))])
+    body = r.json()
+    check("MS-b API phantom mid-plan column -> pre-flight clarify",
+          body.get("status") == "clarify" and "Ghost" in (body.get("clarification") or ""), str(body)[:160])
+
+    main.llm.parse_instruction = lambda i, s, h: {"operations": [
+        {"action": "remove_duplicates", "columns": ["Email"]},
+        {"action": "add_formula_column", "name": "Bad", "formula": "{Email} * 2"}]}
+    r = client.post("/process",
+                    data={"instruction": "dedupe then double the emails", "session_id": "ms", "rewind": "-1", "history": ""},
                     files=[("files", ("t.csv", b"Email\na@x\na@x\nb@x\n", "text/csv"))])
     body = r.json()
     check("MS-b API returns ok with a file", r.status_code == 200 and body["status"] == "ok" and bool(body.get("file_base64")), str(body)[:160])
     check("MS-b API flags partial", body.get("partial") is True, str(body.get("partial")))
-    check("MS-b API warning names the step + reason", body.get("warning") and "Step 2" in body["warning"] and "Ghost" in body["warning"], body.get("warning"))
+    check("MS-b API warning names the step + reason", body.get("warning") and "Step 2" in body["warning"] and "Email" in body["warning"], body.get("warning"))
     check("MS-b API notes show the completed step", any("dupl" in n.lower() for n in body["notes"]), str(body.get("notes")))
 finally:
     main.llm.parse_instruction = _orig

@@ -55,12 +55,12 @@ _, d_pie = chart(df2, {"action": "chart", "chart_type": "pie",
 check("pie uses a single series", d_pie["y_columns"] == ["A"], str(d_pie))
 
 # --- failures (explained, not silent) ---
-try:
-    chart(df, {"action": "chart", "chart_type": "radar",
+try:  # treemap is genuinely unsupported (radar is a real type since Phase 2.4)
+    chart(df, {"action": "chart", "chart_type": "treemap",
                "x_column": "Month", "y_columns": ["Revenue"]})
     check("unsupported chart type explained", False, "no error")
 except OperationError as e:
-    check("unsupported chart type explained", "radar" in str(e), str(e))
+    check("unsupported chart type explained", "treemap" in str(e), str(e))
 
 try:
     chart(df, {"action": "chart", "chart_type": "bar",
