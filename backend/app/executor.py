@@ -205,7 +205,15 @@ def _apply_one(
         df, note, directive = _detect_anomalies(df, op)
         return df, note, directive
     else:
-        raise OperationError(f"Unknown operation: {action!r}")
+        # Reached when a plan names an action this engine doesn't have — a hand-edited
+        # plan, an old saved workflow, or a model that invented one. The old text was
+        # "Unknown operation: 'x'": accurate, but it read like a stack trace and left the
+        # user with nowhere to go.
+        raise OperationError(
+            f"I don't have an operation called '{action}'. If you edited the plan, check "
+            "that step's \"action\"; otherwise just describe what you want in your own "
+            "words and I'll work out the steps."
+        )
     return df, note, None
 
 
@@ -401,7 +409,10 @@ def _combine_sheets(
             f"Available: {', '.join(tables)}."
         )
     if len(names) < 2:
-        raise OperationError("Combining into separate sheets needs at least two tables.")
+        raise OperationError(
+            "Putting each table on its own sheet needs at least two tables, and only one "
+            "was loaded. Upload the other file (or files) and ask again."
+        )
 
     sheets: dict[str, pd.DataFrame] = {}
     for name in names:
@@ -468,7 +479,10 @@ def _merge(tables: dict[str, pd.DataFrame], op: dict) -> tuple[pd.DataFrame, str
             f"Available: {', '.join(tables)}."
         )
     if len(names) < 2:
-        raise OperationError("Merge needs at least two tables.")
+        raise OperationError(
+            "Merging needs at least two tables, and only one was loaded. Upload the "
+            "second file and ask again — I'll match up the columns for you."
+        )
 
     # 1. Synonym map from the plan: each alias -> the unified (canonical) name.
     alias_to_canon: dict[str, str] = {}
@@ -598,6 +612,33 @@ def _limit(df: pd.DataFrame, op: dict) -> tuple[pd.DataFrame, str]:
 _NUMERIC_OPS = {"greater_than", "less_than", "greater_or_equal", "less_or_equal", "between"}
 _TEXT_OPS = {"contains", "starts_with", "ends_with"}
 
+# Plain-language names for every operator _condition_mask handles, used to tell a user
+# what they CAN filter with when they ask for something we don't have. Built from the
+# sets above plus the ones handled inline, and asserted complete by a test — a
+# hand-written list in an error message drifts, and an error that recommends an operator
+# the engine doesn't support is worse than one that stays vague.
+_OPERATOR_WORDS = {
+    "equals": "is",
+    "not_equals": "is not",
+    "in": "is one of",
+    "not_in": "is not one of",
+    "contains": "contains",
+    "starts_with": "starts with",
+    "ends_with": "ends with",
+    "greater_than": "is greater than",
+    "less_than": "is less than",
+    "greater_or_equal": "is at least",
+    "less_or_equal": "is at most",
+    "between": "is between",
+    "is_blank": "is blank",
+    "not_blank": "is not blank",
+}
+
+
+def supported_filter_operators() -> list[str]:
+    """The human names of every filter operator, for error copy and for tests."""
+    return [_OPERATOR_WORDS[k] for k in sorted(_OPERATOR_WORDS)]
+
 
 def _filter(df: pd.DataFrame, op: dict) -> tuple[pd.DataFrame, str]:
     conditions = op.get("conditions") or []
@@ -615,7 +656,10 @@ def _filter(df: pd.DataFrame, op: dict) -> tuple[pd.DataFrame, str]:
         column = cond.get("column")
         operator = (cond.get("operator") or "").lower()
         if not column:
-            raise OperationError("Each filter condition needs a column.")
+            raise OperationError(
+                "One of the filter conditions doesn't say which column to look at. Tell "
+                "me the column to filter on — e.g. \"keep rows where Region is North\"."
+            )
         _require_columns(df, [column])
         mask, desc = _condition_mask(df[column], column, operator, cond.get("value"), cond.get("value2"), cond.get("values"))
         masks.append(mask)
@@ -693,7 +737,12 @@ def _condition_mask(series, column, operator, value, value2, values=None):
         lo, hi = sorted([v1, vals[1]])
         return (comp >= lo) & (comp <= hi), f"{column} between {value} and {value2}"
 
-    raise OperationError(f"I don't understand the filter operator '{operator}'.")
+    raise OperationError(
+        f"I don't know how to filter with '{operator}'. I can check whether a column: "
+        + ", ".join(supported_filter_operators())
+        + ". Try rephrasing with one of those — e.g. \"keep rows where Amount is at "
+        "least 500\"."
+    )
 
 
 def _comparable(series, column, raw_values):
