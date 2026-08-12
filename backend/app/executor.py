@@ -30,6 +30,32 @@ from .operations.sort import sort as _sort
 from .operations.chart import chart as _chart
 from .operations.dashboard import dashboard as _dashboard
 from .operations.reshape import unpivot as _unpivot, pivot as _pivot, transpose as _transpose
+from .operations.conditional_format import conditional_format as _conditional_format
+from .operations.layout import layout_format as _layout_format
+from .operations.excel_table import excel_table as _excel_table
+from .operations.pivot_summary import pivot_summary as _pivot_summary
+from .operations.statistics import statistics as _statistics
+from .operations.explain_notes import explain_changes as _explain_changes
+from .operations.fill_series import (
+    build_series as _build_series,
+    validate_range_name as _validate_range_name,
+)
+from .operations.goal_seek import goal_seek as _goal_seek
+from .operations.sheets_mgmt import sheet_op as _sheet_op
+from .operations.validation import data_validation as _data_validation
+from .operations.split_merge import (
+    fill_by_example as _fill_by_example,
+    merge_columns as _merge_columns,
+    split_column as _split_column,
+)
+from .operations.formula_functions import (
+    M365_FUNCS,
+    REDIRECTS,
+    SUPPORTED as _REGISTRY_FUNCS,
+    _Range,
+    _Spill,
+    _apply as _apply_registry_func,
+)
 
 # Only column-name tokens, arithmetic operators, parens, numbers, and spaces are
 # allowed in a formula once column placeholders are substituted. This guards the
@@ -87,7 +113,7 @@ def _apply_one(
     elif action == "trim":
         df, note = _trim(df, op)
     elif action == "add_formula_column":
-        df, note, directive = _add_formula_column(df, op)
+        df, note, directive = _add_formula_column(df, op, tables)
         return df, note, directive
     elif action == "lookup":
         df, note, directive = _lookup(df, op, tables)
@@ -108,6 +134,28 @@ def _apply_one(
     elif action == "format_cells":
         note, directive = _format_cells(df, op)
         return df, note, directive
+    elif action == "conditional_format":
+        df, note, directive = _conditional_format(df, op, lambda f, d: _eval_formula(f, d, tables))
+        return df, note, directive
+    elif action == "layout_format":
+        df, note, directive = _layout_format(df, op)
+        return df, note, directive
+    elif action == "data_validation":
+        df, note, directive = _data_validation(df, op)
+        return df, note, directive
+    elif action == "excel_table":
+        df, note, directive = _excel_table(df, op)
+        return df, note, directive
+    elif action == "goal_seek":
+        df, note, directive = _goal_seek(df, op, tables, _eval_formula)
+        return df, note, directive
+    elif action == "split_column":
+        df, note = _split_column(df, op)
+    elif action == "merge_columns":
+        df, note, directive = _merge_columns(df, op)
+        return df, note, directive
+    elif action == "fill_by_example":
+        df, note = _fill_by_example(df, op)
     elif action == "chart":
         note, directive = _chart(df, op)
         return df, note, directive
@@ -118,6 +166,12 @@ def _apply_one(
         df, note = _unpivot(df, op)
     elif action == "pivot":
         df, note = _pivot(df, op)
+    elif action == "pivot_summary":
+        df, note, directive = _pivot_summary(df, op)
+        return df, note, directive
+    elif action == "statistics":
+        df, note, directive = _statistics(df, op)
+        return df, note, directive
     elif action == "transpose":
         df, note = _transpose(df, op)
     elif action == "set_cells":
@@ -126,7 +180,8 @@ def _apply_one(
         df, note, directive = _forecast(df, op)
         return df, note, directive
     elif action == "what_if":
-        df, note = _what_if(df, op)
+        df, note, directive = _what_if(df, op)
+        return df, note, directive
     elif action == "detect_anomalies":
         df, note, directive = _detect_anomalies(df, op)
         return df, note, directive
@@ -171,15 +226,84 @@ def execute_multi(
     Returns (result_df, result_table_name, notes, format_ops).
     """
     tables = dict(tables)  # don't mutate the caller's dict
+    originals = dict(tables)  # pre-plan snapshot (ops copy, never mutate in place)
     working = primary
     notes: list[str] = []
     format_ops: list[dict] = []
 
     workbook: dict[str, pd.DataFrame] | None = None  # set by combine_sheets
     workbook_name = "combined"
+    namespace_changed = False  # sheet ops make the WHOLE workbook the result
+    aliases: dict[str, str] = {}  # name_range: plan-scoped {RangeName -> column}
 
     for step_idx, op in enumerate(operations):
         try:
+            # Named-range aliases: later formulas in the SAME plan may say {Prices:} —
+            # substitute textually before the op runs.
+            if aliases and op.get("formula"):
+                fixed = op["formula"]
+                for rn, col in aliases.items():
+                    fixed = re.sub(r"\{\s*" + re.escape(rn) + r"\s*(:?)\}",
+                                   lambda m, c=col: "{" + c + m.group(1) + "}", fixed)
+                if fixed != op["formula"]:
+                    op = {**op, "formula": fixed}
+
+            if op.get("action") == "fill_series":
+                base = tables[working]
+                vals, desc, fits = _build_series(op, len(base))
+                col_name = (op.get("name") or "Series").strip() or "Series"
+                if fits:
+                    if col_name in base.columns and not op.get("overwrite"):
+                        raise OperationError(
+                            f"A column called '{col_name}' already exists. Use a "
+                            "different name, or confirm you want to overwrite it."
+                        )
+                    df = base.copy()
+                    df[col_name] = vals
+                    tables[working] = df
+                    notes.append(f"Filled a new column '{col_name}' with {desc}.")
+                else:
+                    if col_name in tables:
+                        raise OperationError(f"A sheet called '{col_name}' already exists.")
+                    tables[col_name] = pd.DataFrame({col_name: vals})
+                    namespace_changed = True
+                    notes.append(
+                        f"Put {desc} on a new sheet '{col_name}' ({len(vals):,} rows — "
+                        f"the working table has {len(base):,}, so a column wouldn't fit)."
+                    )
+                continue
+
+            if op.get("action") == "name_range":
+                base = tables[working]
+                rn = _validate_range_name(op.get("range_name"), base.columns)
+                col = (op.get("column") or "").strip()
+                if col not in base.columns:
+                    raise OperationError(f"I couldn't find the column '{col}' to name.")
+                aliases[rn] = col
+                format_ops.append({"type": "defined_name", "name": rn, "column": col})
+                notes.append(
+                    f"Named the '{col}' data range '{rn}'. Formulas in this request can "
+                    f"use {{{rn}:}}, and the saved file carries the defined name."
+                )
+                continue
+
+            if op.get("action") == "sheet_op":
+                tables, working, note, directive, changed = _sheet_op(tables, working, op)
+                notes.append(note)
+                if directive is not None:
+                    format_ops.append(directive)
+                namespace_changed = namespace_changed or changed
+                continue
+
+            if op.get("action") == "explain_changes":
+                # Diff the plan's ORIGINAL table against the current one (Phase 1.9).
+                base = originals.get(working, originals.get(primary))
+                note, directive = _explain_changes(base, tables[working], notes)
+                notes.append(note)
+                if directive is not None:
+                    format_ops.append(directive)
+                continue
+
             if op.get("action") == "merge":
                 df, new_name, note = _merge(tables, op)
                 tables[new_name] = df
@@ -219,6 +343,9 @@ def execute_multi(
 
     if workbook is not None:
         return workbook, workbook_name, notes, format_ops
+    if namespace_changed:
+        # Sheet management restructured the workbook — every tab is part of the result.
+        return tables, working, notes, format_ops
     return tables[working], working, notes, format_ops
 
 
@@ -317,14 +444,25 @@ def _merge(tables: dict[str, pd.DataFrame], op: dict) -> tuple[pd.DataFrame, str
             alias_to_canon[str(alias)] = canon
 
     # 2. Auto map: first spelling seen for each normalized name becomes canonical.
+    #    A later column whose normalized name is a CLOSE MATCH (likely a typo, e.g.
+    #    'Custmer_ID' vs 'Customer_ID') is unified to the earlier one — Phase 3.1 fuzzy.
     norm_to_canon: dict[str, str] = {}
+    fuzzy_norms: set[str] = set()
     for name in names:
         for col in tables[name].columns:
             key = _norm_col(col)
-            if key and key not in norm_to_canon:
+            if not key or key in norm_to_canon:
+                continue
+            close = (difflib.get_close_matches(key, list(norm_to_canon), n=1, cutoff=0.85)
+                     if len(key) >= 4 else [])
+            if close:
+                norm_to_canon[key] = norm_to_canon[close[0]]  # unify to the existing spelling
+                fuzzy_norms.add(key)
+            else:
                 norm_to_canon[key] = str(col)
 
     unified: set[tuple[str, str]] = set()
+    fuzzy_unified: set[tuple[str, str]] = set()
     frames = []
     for name in names:
         df = tables[name]
@@ -333,9 +471,9 @@ def _merge(tables: dict[str, pd.DataFrame], op: dict) -> tuple[pd.DataFrame, str
             canon = alias_to_canon.get(col) or norm_to_canon.get(_norm_col(col))
             if canon and canon != col:
                 rename[col] = canon
+                (fuzzy_unified if _norm_col(col) in fuzzy_norms else unified).add((str(col), canon))
         if rename:
             df = df.rename(columns=rename)
-            unified.update(rename.items())
         frames.append(df)
 
     new_name = op.get("new_table") or "merged"
@@ -365,6 +503,9 @@ def _merge(tables: dict[str, pd.DataFrame], op: dict) -> tuple[pd.DataFrame, str
     if unified:
         pairs = ", ".join(f"'{a}'→'{b}'" for a, b in sorted(unified))
         note += f" Unified columns with the same meaning: {pairs}."
+    if fuzzy_unified:
+        pairs = ", ".join(f"'{a}'→'{b}'" for a, b in sorted(fuzzy_unified))
+        note += f" Treated near-identical column names as the same (likely typos): {pairs}."
     conflicts = _merge_type_conflicts(frames)
     if conflicts:
         cols = ", ".join(f"'{c}'" for c in conflicts)
@@ -427,6 +568,10 @@ def _filter(df: pd.DataFrame, op: dict) -> tuple[pd.DataFrame, str]:
     if not conditions:
         raise OperationError("Filter needs at least one condition.")
     combine = (op.get("combine") or "and").lower()
+    if combine not in {"and", "or"}:  # free-text field now — don't silently AND
+        raise OperationError(
+            f"I don't understand combining conditions with '{combine}' — use and / or."
+        )
 
     masks: list[pd.Series] = []
     descriptions: list[str] = []
@@ -655,8 +800,10 @@ def _drop_invalid(df: pd.DataFrame, op: dict) -> tuple[pd.DataFrame, str]:
         raise OperationError("Which column should I check for invalid values?")
     _require_columns(df, columns)
     kind = (op.get("data_type") or "number").lower()
-    if kind not in {"number", "date"}:
-        kind = "number"
+    if kind not in {"number", "date"}:  # never silently guess a type
+        raise OperationError(
+            f"I can't check for invalid '{kind}' values — I can check numbers or dates."
+        )
 
     invalid = pd.Series(False, index=df.index)
     examples: list[str] = []
@@ -785,13 +932,53 @@ _FORMULA_FUNCS = {"SUM", "AVERAGE", "AVG", "MEAN", "MIN", "MAX", "ROUND", "ABS",
 _ARITH_OPS = (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow, ast.Mod)
 
 
-def _eval_formula(formula: str, df: pd.DataFrame):
+def _resolve_sheet_name(available, want: str) -> str | None:
+    """Find the real sheet key for a user-facing name. Multi-file loads prefix sheets
+    ('report.xlsx - Prices') and saved workbooks may truncate titles to 31 chars, but
+    users (and the Brain) say 'Prices' — match exactly first, then by the ' - ' tail.
+    Returns None unless the match is unambiguous."""
+    names = list(available)
+    low = want.strip().lower()
+    exact = [n for n in names if str(n).strip().lower() == low]
+    if len(exact) == 1:
+        return exact[0]
+    tails = [n for n in names if str(n).split(" - ")[-1].strip().lower() == low]
+    if len(tails) == 1:
+        return tails[0]
+    # Tail-vs-tail: the caller may hold a FULL table name ('file - Prices') while the
+    # workbook tab was stem-truncated ('file_trunc - Prices') — compare the sheet parts.
+    want_tail = low.split(" - ")[-1].strip()
+    tt = [n for n in names if str(n).split(" - ")[-1].strip().lower() == want_tail]
+    if len(tt) == 1:
+        return tt[0]
+    return None
+
+
+def _parse_ref(inner: str) -> tuple[str | None, str, bool]:
+    """Decode a {placeholder}'s inner text -> (sheet, column, is_range).
+
+    Grammar (Phase 1.1):  {Col} = this row's cell · {Col:} = the column's data range ·
+    {Sheet.Col:} = a range on another sheet (sheet-qualified refs are ranges only)."""
+    text = inner.strip()
+    is_range = text.endswith(":")
+    if is_range:
+        text = text[:-1].strip()
+    sheet = None
+    if is_range and "." in text:
+        sheet, text = text.split(".", 1)
+        sheet, text = sheet.strip(), text.strip()
+    return sheet, text, is_range
+
+
+def _eval_formula(formula: str, df: pd.DataFrame, tables: dict | None = None,
+                  notes: list | None = None, extra: dict | None = None):
     """Safely evaluate an Excel-ish per-row formula over the DataFrame's columns.
 
     Uses Python's ast with a strict whitelist (no eval/exec) so it can't run arbitrary
-    code. Supports + - * / % ** , parentheses, comparisons, AND/OR, and the functions
-    in _FORMULA_FUNCS. {Column} placeholders are mapped to the column Series.
-    """
+    code. Supports + - * / % ** & , parentheses, comparisons, AND/OR, string literals,
+    TRUE/FALSE, and the functions in _FORMULA_FUNCS + the Phase-1.1 registry. {Column}
+    placeholders map to row Series; {Column:} / {Sheet.Column:} map to _Range args for
+    range-taking functions (SUMIF, XLOOKUP, RANK, UNIQUE, ...)."""
     if len(formula) > 2000:  # guard against pathological/deeply-nested expressions
         raise OperationError("That formula is too long — please simplify it.")
 
@@ -806,9 +993,37 @@ def _eval_formula(formula: str, df: pd.DataFrame):
     safe = safe.replace("<>", "!=")  # Excel not-equal -> Python
     safe = re.sub(r"(?<![<>=!])=(?!=)", "==", safe)  # Excel '=' equality -> '=='
 
-    env: dict[str, pd.Series] = {}
-    for col, ident in colmap.items():
-        env[ident] = pd.to_numeric(df[col], errors="coerce") if _is_numeric_like(df[col]) else df[col]
+    env: dict[str, object] = {}
+    for ref, ident in colmap.items():
+        sheet, col, is_range = _parse_ref(ref)
+        if sheet is None and extra and col in extra:
+            # A caller-supplied scalar binding (Goal Seek's {var} unknown).
+            env[ident] = extra[col]
+            continue
+        if sheet is not None:
+            real = _resolve_sheet_name((tables or {}).keys(), sheet)
+            src = (tables or {}).get(real) if real else None
+            if src is None:
+                names = ", ".join((tables or {}).keys()) or "none"
+                raise OperationError(
+                    f"#REF!: there's no sheet called '{sheet}' (available: {names})."
+                )
+            if col not in src.columns:
+                raise OperationError(
+                    f"#REF!: sheet '{sheet}' has no column '{col}' "
+                    f"(it has: {', '.join(map(str, src.columns))})."
+                )
+            env[ident] = _Range(src[col].reset_index(drop=True), sheet, col)
+        elif is_range:
+            if col not in df.columns:
+                raise OperationError(f"#REF!: I couldn't find the column '{col}'.")
+            env[ident] = _Range(df[col], None, col)
+        else:
+            env[ident] = (
+                pd.to_numeric(df[col], errors="coerce") if _is_numeric_like(df[col]) else df[col]
+            )
+    # Evaluation context shared with the function registry (row count, index, soft notes).
+    env["__ctx__"] = {"n": len(df), "index": df.index, "notes": notes if notes is not None else []}
 
     try:
         tree = ast.parse(safe, mode="eval")
@@ -817,23 +1032,47 @@ def _eval_formula(formula: str, df: pd.DataFrame):
     return _ev(tree.body, env, len(df), df.index)
 
 
+def _unrange(v):
+    """Ranges may be compared/combined directly (FILTER({Price:}, {Region:}="North")) —
+    operators see the underlying Series; only functions care about range-ness."""
+    return v.series if isinstance(v, _Range) else v
+
+
 def _ev(node, env, n, index):
     if isinstance(node, ast.Constant):
         return node.value
     if isinstance(node, ast.Name):
         if node.id in env:
             return env[node.id]
+        upper = node.id.upper()
+        if upper == "TRUE":
+            return True
+        if upper == "FALSE":
+            return False
         raise OperationError(f"Unknown name in formula: '{node.id}'.")
     if isinstance(node, ast.UnaryOp):
-        v = _ev(node.operand, env, n, index)
+        v = _unrange(_ev(node.operand, env, n, index))
         if isinstance(node.op, ast.USub):
             return -v
         if isinstance(node.op, ast.UAdd):
             return +v
         raise OperationError("Unsupported operator in formula.")
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitAnd):
+        # Excel's & is text concatenation.
+        def txt(v):
+            v = _unrange(v)
+            if isinstance(v, pd.Series):
+                if pd.api.types.is_numeric_dtype(v):
+                    return v.map(lambda x: "" if pd.isna(x)
+                                 else (str(int(x)) if float(x).is_integer() else str(x)))
+                return v.astype("string").fillna("")
+            return "" if v is None else str(v)
+        left = txt(_ev(node.left, env, n, index))
+        right = txt(_ev(node.right, env, n, index))
+        return left + right
     if isinstance(node, ast.BinOp) and isinstance(node.op, _ARITH_OPS):
-        left = _ev(node.left, env, n, index)
-        right = _ev(node.right, env, n, index)
+        left = _unrange(_ev(node.left, env, n, index))
+        right = _unrange(_ev(node.right, env, n, index))
         for operand in (left, right):
             if isinstance(operand, pd.Series) and operand.dtype == object:
                 raise OperationError(
@@ -852,8 +1091,12 @@ def _ev(node, env, n, index):
             return _safe_pow(left, right)
         return left % right
     if isinstance(node, ast.Compare) and len(node.ops) == 1:
-        left = _ev(node.left, env, n, index)
-        right = _ev(node.comparators[0], env, n, index)
+        left = _unrange(_ev(node.left, env, n, index))
+        right = _unrange(_ev(node.comparators[0], env, n, index))
+        # Excel compares text case-insensitively ({Region:}="north" matches "North").
+        if isinstance(left, pd.Series) and isinstance(right, str):
+            left = left.astype("string").str.strip().str.lower()
+            right = right.strip().lower()
         op = node.ops[0]
         if isinstance(op, ast.Gt):
             return left > right
@@ -868,17 +1111,30 @@ def _ev(node, env, n, index):
         if isinstance(op, ast.NotEq):
             return left != right
     if isinstance(node, ast.BoolOp):
-        vals = [_ev(v, env, n, index) for v in node.values]
+        vals = [_unrange(_ev(v, env, n, index)) for v in node.values]
         out = vals[0]
         for v in vals[1:]:
             out = (out & v) if isinstance(node.op, ast.And) else (out | v)
         return out
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
         fname = node.func.id.upper()
-        if fname not in _FORMULA_FUNCS:
-            raise OperationError(f"The function {node.func.id}() isn't supported yet.")
         args = [_ev(a, env, n, index) for a in node.args]
-        return _apply_formula_func(fname, args, n, index)
+        # Legacy row-wise functions keep their exact pre-1.1 behaviour — but only for
+        # row arguments: SUM({Price:}) with a RANGE is a true whole-column aggregate
+        # and belongs to the registry (row-wise SUM of a range would return the column
+        # itself, silently wrong).
+        has_range = any(isinstance(a, _Range) for a in args)
+        if fname in _FORMULA_FUNCS and not has_range:
+            return _apply_formula_func(fname, [_unrange(a) for a in args], n, index)
+        # …the Phase-1.1 registry handles the wider families (ranges stay wrapped)…
+        if fname in _REGISTRY_FUNCS:
+            return _apply_registry_func(fname, args, env["__ctx__"])
+        # …and known-but-unsupported functions get an honest, useful redirect.
+        if fname in REDIRECTS:
+            raise OperationError(f"{fname}() isn't generated here — {REDIRECTS[fname]}.")
+        close = difflib.get_close_matches(fname, sorted(_REGISTRY_FUNCS | _FORMULA_FUNCS), n=1, cutoff=0.75)
+        hint = f" Did you mean {close[0]}()?" if close else ""
+        raise OperationError(f"#NAME?: the function {node.func.id}() isn't supported yet.{hint}")
     raise OperationError("That formula uses something I can't evaluate.")
 
 
@@ -948,10 +1204,17 @@ def _apply_formula_func(fname, args, n, index):
 # When a formula would yield an Excel error, we try ONE targeted repair per error
 # class, then re-evaluate. The loop is bounded (each fix removes its own trigger, so
 # it converges) — if a class can't be repaired we raise a clear explanation instead
-# of looping. The three classes mirror Excel:
-#   #REF!    a referenced column doesn't exist          -> remap to the closest real one
-#   #VALUE!  arithmetic hits text                        -> coerce numbers-from-text
-#   #DIV/0!  a division hit a zero denominator           -> blank those rows (+ guard the saved formula)
+# of looping. Full Excel error taxonomy (Phase 3.4) and how Sumio handles each:
+#   #REF!    a referenced column doesn't exist          -> REPAIR: remap to the closest real one
+#   #VALUE!  arithmetic hits text                        -> REPAIR: coerce numbers-from-text (else EXPLAIN)
+#   #DIV/0!  a division hit a zero denominator           -> REPAIR: blank those rows (+ guard the saved formula)
+#   #NUM!    invalid math (root of a negative, log<=0,    -> REPAIR: blank only rows whose inputs were
+#            overflow)                                          present (blank-propagation is NOT an error)
+#   #NAME?   an unknown/unsupported function              -> EXPLAIN (redirect to a supported form; never loop)
+#   #N/A     a lookup found no match                      -> PREVENTED: lookup writes "Not found", never #N/A
+#   #NULL!   two ranges that don't intersect              -> NOT PRODUCIBLE: Sumio has no range-intersection op
+#   #SPILL!  a dynamic array can't spill                  -> PREVENTED: the live-pivot writer clears the anchor
+#   #CALC!   a dynamic-array calculation error            -> NOT PRODUCIBLE: values are computed in pandas
 _MAX_FORMULA_REPAIRS = 6
 
 
@@ -1005,7 +1268,8 @@ def _guard_division(formula: str) -> str | None:
 
 
 def _compute_formula_self_correcting(
-    df: pd.DataFrame, name: str, formula: str
+    df: pd.DataFrame, name: str, formula: str,
+    tables: dict | None = None, notes: list | None = None,
 ) -> tuple[pd.Series, str, str, list[str]]:
     """Evaluate `formula`, auto-repairing #REF!/#VALUE!/#DIV/0! where possible.
 
@@ -1019,9 +1283,15 @@ def _compute_formula_self_correcting(
     value_repaired = False
 
     for _ in range(_MAX_FORMULA_REPAIRS):
-        referenced = _PLACEHOLDER.findall(work_formula)
+        # Decode refs with the Phase-1.1 grammar. Same-sheet refs (row or {Col:} range)
+        # are repairable here; sheet-qualified refs are validated inside _eval_formula
+        # with their own clear #REF! messages (no cross-sheet fuzzy repair).
+        raw_refs = _PLACEHOLDER.findall(work_formula)
+        parsed = [(r, *_parse_ref(r)) for r in raw_refs]  # (raw, sheet, col, is_range)
+        referenced = [col for _, sheet, col, _ in parsed if sheet is None]
+        row_refs = [col for _, sheet, col, is_range in parsed if sheet is None and not is_range]
 
-        # ---- #REF! : a referenced column doesn't exist ----
+        # ---- #REF! : a referenced same-sheet column doesn't exist ----
         missing = [c for c in referenced if c not in work_df.columns]
         if missing:
             fixes: dict[str, str] = {}
@@ -1037,7 +1307,12 @@ def _compute_formula_self_correcting(
                     f"used in '{name}'. Available columns: {', '.join(work_df.columns)}."
                 )
             for bad, good in fixes.items():
-                work_formula = re.sub(r"\{" + re.escape(bad) + r"\}", "{" + good + "}", work_formula)
+                # Repair both {Bad} and {Bad:} forms, keeping the range suffix.
+                work_formula = re.sub(
+                    r"\{" + re.escape(bad) + r"(:?)\}",
+                    lambda m: "{" + good + m.group(1) + "}",
+                    work_formula,
+                )
                 repairs.append(f"#REF!: replaced missing {{{bad}}} with the closest column {{{good}}}")
             continue  # re-check with corrected references
 
@@ -1045,7 +1320,7 @@ def _compute_formula_self_correcting(
 
         # ---- #VALUE! (plain arithmetic on text) : coerce numbers-from-text ----
         if not advanced:
-            problem = [c for c in referenced if not _is_numeric_like(work_df[c])]
+            problem = [c for c in row_refs if not _is_numeric_like(work_df[c])]
             if problem:
                 fixable, unfixable = [], []
                 for c in problem:
@@ -1071,14 +1346,14 @@ def _compute_formula_self_correcting(
 
         # ---- evaluate ----
         try:
-            result = _eval_formula(work_formula, work_df)
+            result = _eval_formula(work_formula, work_df, tables, notes)
         except OperationError as exc:
             msg = str(exc)
             # #VALUE! inside an advanced formula (arithmetic hit a text column)
             if "text" in msg.lower() and not value_repaired:
                 coerced = []
                 tmp = work_df.copy()
-                for c in referenced:
+                for c in row_refs:
                     if not _is_numeric_like(tmp[c]):
                         num = pd.to_numeric(tmp[c], errors="coerce")
                         if num.notna().any():
@@ -1098,18 +1373,44 @@ def _compute_formula_self_correcting(
         # ---- #DIV/0! : a division produced infinity ----
         display_formula = work_formula
         directive_formula = work_formula
+        divzero_mask = None
         if "/" in work_formula and isinstance(result, pd.Series):
             res_num = pd.to_numeric(result, errors="coerce")
             inf_mask = np.isinf(res_num)
             div0 = int(inf_mask.sum())
             if div0:
-                result = result.mask(inf_mask.to_numpy())
+                divzero_mask = inf_mask.to_numpy()
+                result = result.mask(divzero_mask)
                 repairs.append(
                     f"#DIV/0!: blanked {div0} row{'s' if div0 != 1 else ''} that divide by zero"
                 )
                 guarded = _guard_division(work_formula)
                 if guarded:
                     directive_formula = guarded
+
+        # ---- #NUM! : a valid-number input produced an INVALID number (root of a
+        # negative, log of <=0, overflow). Blank ONLY rows whose referenced inputs were
+        # all PRESENT (so a blank cell propagating a blank isn't mistaken for an error)
+        # and that weren't already a divide-by-zero. Skip when the formula is text-valued
+        # (no finite numbers at all) so a text result isn't falsely flagged.
+        if isinstance(result, pd.Series):
+            rn = pd.to_numeric(result, errors="coerce").to_numpy(dtype="float64", na_value=np.nan)
+            nonfinite = ~np.isfinite(rn)
+            if divzero_mask is not None:
+                nonfinite = nonfinite & ~divzero_mask
+            refs_present = [c for c in row_refs if c in work_df.columns]
+            if refs_present and nonfinite.any() and np.isfinite(rn).any():
+                present = np.logical_and.reduce(
+                    [~_blank_mask(work_df[c]).to_numpy() for c in refs_present]
+                )
+                num_mask = nonfinite & present
+                n = int(num_mask.sum())
+                if n:
+                    result = result.mask(num_mask)
+                    repairs.append(
+                        f"#NUM!: blanked {n} row{'s' if n != 1 else ''} that produced an invalid "
+                        "number (e.g. the square root of a negative, log of zero, or overflow)"
+                    )
         return result, directive_formula, display_formula, repairs
 
     # Safety net — should never be reached (each repair removes its own trigger).
@@ -1119,7 +1420,12 @@ def _compute_formula_self_correcting(
     )
 
 
-def _add_formula_column(df: pd.DataFrame, op: dict) -> tuple[pd.DataFrame, str, dict | None]:
+_FUNC_TOKEN = re.compile(r"([A-Za-z][A-Za-z0-9_.]*)\s*\(")
+
+
+def _add_formula_column(
+    df: pd.DataFrame, op: dict, tables: dict | None = None
+) -> tuple[pd.DataFrame, str, dict | None]:
     name = (op.get("name") or "").strip()
     formula = op.get("formula") or ""
     if not name:
@@ -1136,20 +1442,61 @@ def _add_formula_column(df: pd.DataFrame, op: dict) -> tuple[pd.DataFrame, str, 
 
     # Compute with the self-correcting evaluator: it detects #REF!/#VALUE!/#DIV/0!
     # and auto-repairs where it can, or raises a plain explanation when it can't.
+    soft_notes: list[str] = []
     result, directive_formula, display_formula, repairs = _compute_formula_self_correcting(
-        df, name, formula
+        df, name, formula, tables, soft_notes
     )
 
+    # Dynamic-array (spill) results are shorter/longer than the frame: pad or trim the
+    # PREVIEW to the frame, and mark the directive so the serializer writes ONE spilling
+    # formula (Excel fills the rest) instead of copying it down every row.
+    spill = isinstance(result, _Spill)
     df = df.copy()
-    df[name] = result.values if isinstance(result, pd.Series) else result
+    if spill:
+        if len(result) > len(df):
+            soft_notes.append(
+                f"the formula spills {len(result):,} values but the sheet has "
+                f"{len(df):,} data rows — the preview shows the first {len(df):,}; "
+                "in Excel the live formula spills the full set"
+            )
+        vals = list(result)[: len(df)]
+        vals += [np.nan] * (len(df) - len(vals))
+        df[name] = vals
+    else:
+        df[name] = result.values if isinstance(result, pd.Series) else result
 
     # Emit a directive so the saved .xlsx gets a LIVE Excel formula (e.g. =B2*C2) — the
     # serializer fills in real cell references from the final layout. When a division was
     # guarded, the directive carries the safe IF(...) form so Excel won't show #DIV/0!.
-    directive = {"type": "formula", "column": name, "formula": directive_formula}
+    directive = {"type": "formula", "column": name, "formula": directive_formula, "spill": spill}
+    # Cross-sheet ranges ({Prices.Unit_Price:}) need those sheets IN the output workbook
+    # for the live formula to reference — attach their data so the serializer can write
+    # any that are missing (same pattern as the lookup op's source_df).
+    source_sheets: dict = {}
+    for raw in _PLACEHOLDER.findall(directive_formula):
+        ref_sheet, _, _ = _parse_ref(raw)
+        if ref_sheet and ref_sheet not in source_sheets:
+            real = _resolve_sheet_name((tables or {}).keys(), ref_sheet)
+            if real is not None:
+                source_sheets[ref_sheet] = tables[real]
+    if source_sheets:
+        directive["source_sheets"] = source_sheets
     note = f"Added column '{name}' = {display_formula}."
     if repairs:
         note += " Auto-corrected: " + "; ".join(repairs) + "."
+
+    # Version awareness (Phase 1.1): name the minimum Excel for modern functions. The
+    # preview values are Sumio-computed either way, so the data is usable everywhere.
+    used = {t.upper() for t in _FUNC_TOKEN.findall(directive_formula)}
+    needs = {f: v for f, v in M365_FUNCS.items() if f in used}
+    if needs:
+        reqs = "; ".join(f"{f} needs {v}" for f, v in sorted(needs.items()))
+        note += (
+            f" Note: {reqs} — older Excel shows #NAME? for the live formula, but the "
+            "computed values are shown in the preview and saved with the file."
+        )
+    for extra in soft_notes:
+        note += f" Note: {extra}."
     return df, note, directive
 
 
@@ -1208,17 +1555,45 @@ def _lookup(df: pd.DataFrame, op: dict, sheets: dict[str, pd.DataFrame]) -> tupl
         if k is not None
     }
 
-    norm_df_keys = _norm_key(df[key_column])
-    fetched = norm_df_keys.map(mapping)
-    matched = int(fetched.notna().sum())
+    norm_df_keys = _norm_key(df[key_column]).reset_index(drop=True)
+    fetched = norm_df_keys.map(mapping)  # positional (0..n-1) after the reset above
 
     # How many matched ONLY because we normalized? (exact case/space/type-sensitive
     # match would have missed them.) Used to honestly flag the behavior to the user.
     exact_keys = set(source[source_key_column].dropna())
     exact_matched = int(df[key_column].isin(exact_keys).sum())
 
+    # --- Fuzzy / typo-tolerant fallback (Phase 3.1) --------------------------------
+    # For keys that still didn't match, look for a CLOSE source key (edit-distance) —
+    # so "Jon Smith" finds "John Smith". Only high-confidence matches, and each fuzzy
+    # hit is written as a STATIC value (a typo match can't be reproduced by a live
+    # Excel formula) and honestly reported so the user can verify it.
+    static_overrides: dict[int, object] = {}
+    fuzzy_examples: list[str] = []
+    fuzzy_count = 0
+    source_norm_list = list(mapping.keys())
+    orig_keys = df[key_column].reset_index(drop=True)
+    unmatched_positions = [p for p in range(len(fetched))
+                           if pd.isna(fetched.iloc[p]) and norm_df_keys.iloc[p] is not None]
+    # Guard against an O(rows × keys) blow-up on large data.
+    if unmatched_positions and len(source_norm_list) <= 5000 and len(unmatched_positions) <= 5000:
+        norm_to_orig: dict[str, object] = {}
+        for orig, nk in zip(deduped[source_key_column], _norm_key(deduped[source_key_column])):
+            if nk is not None:
+                norm_to_orig.setdefault(nk, orig)
+        for p in unmatched_positions:
+            close = difflib.get_close_matches(norm_df_keys.iloc[p], source_norm_list, n=1, cutoff=0.85)
+            if close:
+                val = mapping[close[0]]
+                fetched.iloc[p] = val
+                static_overrides[p] = val
+                fuzzy_count += 1
+                if len(fuzzy_examples) < 3:
+                    fuzzy_examples.append(f"'{orig_keys.iloc[p]}'→'{norm_to_orig.get(close[0], close[0])}'")
+
+    matched = int(fetched.notna().sum())
     df = df.copy()
-    df[new_column] = fetched.where(fetched.notna(), "Not found")
+    df[new_column] = fetched.where(fetched.notna(), "Not found").values  # positional assign
 
     note = (
         f"Looked up '{return_column}' from sheet '{source_sheet}' by '{key_column}' "
@@ -1226,10 +1601,17 @@ def _lookup(df: pd.DataFrame, op: dict, sheets: dict[str, pd.DataFrame]) -> tupl
     )
     if had_dupes:
         note += " The source had duplicate keys, so I used the first match."
-    if matched > exact_matched:
+    normalized_extra = matched - exact_matched - fuzzy_count
+    if normalized_extra > 0:
         note += (
-            f" {matched - exact_matched} row(s) matched only after ignoring case, "
+            f" {normalized_extra} row(s) matched only after ignoring case, "
             "surrounding spaces, or number-vs-text differences."
+        )
+    if fuzzy_count:
+        eg = " (e.g. " + ", ".join(fuzzy_examples) + ")" if fuzzy_examples else ""
+        note += (
+            f" {fuzzy_count} row(s) matched by CLOSE SIMILARITY — likely typos{eg}. "
+            "These are written as fixed values (not live formulas), so please verify them."
         )
 
     # We compute values now (for preview/JSON), AND emit a directive so the saved
@@ -1246,6 +1628,9 @@ def _lookup(df: pd.DataFrame, op: dict, sheets: dict[str, pd.DataFrame]) -> tupl
         "source_key_column": source_key_column,
         "return_column": return_column,
         "source_norm_keys": [("" if k is None else k) for k in _norm_key(source[source_key_column])],
+        # Phase 3.1: rows that matched only by fuzzy similarity are written as STATIC
+        # values (a typo match can't be an Excel formula) — {positional row -> value}.
+        "static_overrides": static_overrides,
     }
     return df, note, directive
 
@@ -1457,8 +1842,17 @@ def _select_columns(df: pd.DataFrame, op: dict) -> tuple[pd.DataFrame, str]:
     if not columns:
         raise OperationError("Which column(s) should I keep?")
     _require_columns(df, columns)
+    # Say what was DROPPED, not just what was kept: "keep these two" can quietly delete
+    # eighteen others, and the user should see that number without counting headers.
+    dropped = [str(c) for c in df.columns if c not in columns]
     df = df[columns]
-    return df, f"Kept only: {', '.join(columns)}."
+    if not dropped:
+        return df, f"Kept only: {', '.join(columns)} (nothing else to remove)."
+    shown = ", ".join(dropped[:6]) + ("…" if len(dropped) > 6 else "")
+    return df, (
+        f"Kept only: {', '.join(columns)} — removed "
+        f"{len(dropped)} column{'s' if len(dropped) != 1 else ''} ({shown})."
+    )
 
 
 def _format_mismatch(df: pd.DataFrame, columns: list[str], number_format: str) -> list[str]:
@@ -1708,12 +2102,16 @@ def _forecast(df: pd.DataFrame, op: dict) -> tuple[pd.DataFrame, str]:
     return result, note, directive
 
 
-def _what_if(df: pd.DataFrame, op: dict) -> tuple[pd.DataFrame, str]:
+def _what_if(df: pd.DataFrame, op: dict) -> tuple[pd.DataFrame, str, dict | None]:
     """Add a scenario column showing the impact of a hypothetical change.
 
     The LLM provides `column` (the base), `formula` (using {column} placeholders),
     and `name` (the scenario column label). We evaluate the formula, compute the
-    delta, and add a summary note.
+    delta, and add a summary note plus a structured before/after directive so the UI
+    can show the scenario impact the same way it shows forecast/anomaly analyses.
+
+    A what-if is EXACT deterministic arithmetic, not a prediction — so, unlike the
+    forecast, it carries no "confidence %" (that would imply a false uncertainty).
     """
     col = op.get("column")
     formula = op.get("formula") or ""
@@ -1739,28 +2137,42 @@ def _what_if(df: pd.DataFrame, op: dict) -> tuple[pd.DataFrame, str]:
         result = df.copy()
         result[scenario_name] = scenario_vals
 
-    # Summary: compare original vs scenario for numeric columns
+    # Summary: compare original vs scenario for numeric columns (the "before/after").
     orig_num = pd.to_numeric(df[col], errors="coerce")
     new_num = pd.to_numeric(result[scenario_name], errors="coerce")
+    before = after = delta = pct = None
     if orig_num.notna().any() and new_num.notna().any():
-        orig_total = float(orig_num.sum())
-        new_total = float(new_num.sum())
-        if orig_total != 0:
-            pct = (new_total - orig_total) / abs(orig_total) * 100
+        before = float(orig_num.sum())
+        after = float(new_num.sum())
+        delta = after - before
+        if before != 0:
+            pct = delta / abs(before) * 100
             note = (
                 f"What-if scenario: if '{col}' follows '{formula}', total goes from "
-                f"{orig_total:,.2f} → {new_total:,.2f} ({pct:+.1f}%). "
+                f"{before:,.2f} → {after:,.2f} ({pct:+.1f}%). "
                 f"Scenario values are in '{scenario_name}'."
             )
         else:
             note = (
                 f"What-if scenario added as '{scenario_name}' "
-                f"(total: {new_total:,.2f})."
+                f"(total: {after:,.2f})."
             )
     else:
         note = f"What-if scenario added as '{scenario_name}'."
 
-    return result, note
+    # Structured before/after directive (Phase 4.5) — parallels the forecast/anomaly
+    # `analysis` blocks so /process surfaces the scenario impact uniformly. No confidence
+    # key: the math is exact, and inventing a % would misrepresent it as a prediction.
+    directive = {
+        "type": "analysis", "kind": "what_if", "column": col,
+        "scenario_column": scenario_name, "formula": formula,
+        "before": None if before is None else round(before, 4),
+        "after": None if after is None else round(after, 4),
+        "delta": None if delta is None else round(delta, 4),
+        "pct": None if pct is None else round(pct, 2),
+        "detail": "Exact deterministic scenario — no forecast uncertainty.",
+    }
+    return result, note, directive
 
 
 def _detect_anomalies(df: pd.DataFrame, op: dict) -> tuple[pd.DataFrame, str]:

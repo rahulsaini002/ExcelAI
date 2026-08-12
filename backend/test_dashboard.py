@@ -57,7 +57,10 @@ check("KPI sum as currency", kpis["Total Revenue"] == "₹450", str(kpis))
 check("KPI sum as number", kpis["Orders"] == "12", str(kpis))
 check("KPI plain row count", kpis["Months"] == "3", str(kpis))
 check("two charts validated", len(d["charts"]) == 2, str(d["charts"]))
-check("summary carried", d["summary"] == "Revenue peaked in February.", str(d))
+# summary now COMPOSES the Brain narrative + trusted figures (Phase 2.5 hardening)
+check("summary keeps the narrative", "Revenue peaked in February." in d["summary"], str(d["summary"]))
+check("summary adds trusted figures from KPIs", "₹450" in d["summary"] and "By the numbers" in d["summary"],
+      str(d["summary"]))
 check("title carried", d["title"] == "Shop overview", str(d))
 
 # --- data unchanged + flows through the executor ---
@@ -80,12 +83,17 @@ try:
 except OperationError:
     check("bad KPI column errors", True)
 
-try:
+try:  # treemap is genuinely unsupported (radar is a real dashboard chart since 2.4/2.5)
     dashboard(df, {"action": "dashboard",
-                   "charts": [{"chart_type": "radar", "x_column": "Month", "y_columns": ["Revenue"]}]})
+                   "charts": [{"chart_type": "treemap", "x_column": "Month", "y_columns": ["Revenue"]}]})
     check("unsupported dashboard chart errors", False, "no error")
 except OperationError:
     check("unsupported dashboard chart errors", True)
+
+# radar (a full-set type) is now VALID inside a dashboard
+_, d_radar = dashboard(df, {"action": "dashboard",
+                            "charts": [{"chart_type": "radar", "x_column": "Month", "y_columns": ["Revenue"]}]})
+check("radar chart valid in a dashboard", d_radar["charts"][0]["chart_type"] == "radar", str(d_radar["charts"]))
 
 try:
     dashboard(df, {"action": "dashboard"})  # no kpis, no charts

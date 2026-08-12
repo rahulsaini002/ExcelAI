@@ -10,9 +10,8 @@ from __future__ import annotations
 
 import pandas as pd
 
-from .base import OperationError, require_columns
-
-SUPPORTED_CHART = ("bar", "line", "pie", "area")
+from .base import OperationError
+from .chart import chart as _validate_chart
 
 
 def _is_numeric(series: pd.Series) -> bool:
@@ -73,51 +72,57 @@ def dashboard(df: pd.DataFrame, op: dict) -> tuple[str, dict]:
     if len(df) == 0:
         raise OperationError("There's no data to build a dashboard from yet.")
 
-    # KPIs — compute each value now from the current data.
+    # KPIs — compute each value NOW from the current data (trusted, never model-supplied).
     kpis_out: list[dict] = []
+    uncomputable = 0
     for k in op.get("kpis") or []:
         label = (k.get("label") or "").strip() or "Metric"
         column = k.get("column")
         if column and column not in df.columns:
-            require_columns(df, [column])  # raises a friendly "I don't see the column…"
+            _require(df, column)  # raises a friendly "I don't see the column…"
         value = _compute_kpi(df, k.get("agg"), column, k.get("format"))
+        if value is None:
+            uncomputable += 1
         kpis_out.append({"label": label, "value": value if value is not None else "—"})
 
-    # Charts — validate each (same rules as the chart operation).
+    # Charts — validate each through the SAME path as the chart operation, so dashboards
+    # get the full chart family (bar/line/area/pie/doughnut/radar/stock/scatter/bubble),
+    # the numeric-x checks, and the honest "unsupported type" fallbacks for free.
     charts_out: list[dict] = []
     for c in op.get("charts") or []:
-        ct = (c.get("chart_type") or "bar").strip().lower()
-        if ct == "column":
-            ct = "bar"
-        if ct not in SUPPORTED_CHART:
-            raise OperationError(
-                f"I can't make a '{ct}' chart yet — I can do {', '.join(SUPPORTED_CHART)}."
-            )
-        x = c.get("x_column")
-        ys = [y for y in (c.get("y_columns") or []) if y]
-        if not x or not ys:
-            raise OperationError("Each dashboard chart needs an x column and a value column.")
-        require_columns(df, [x, *ys])
-        non_numeric = [y for y in ys if not _is_numeric(df[y])]
-        if non_numeric:
-            names = ", ".join(f"'{y}'" for y in non_numeric)
-            raise OperationError(f"A chart's value column must be numbers, but {names} is not.")
-        if ct == "pie":
-            ys = ys[:1]
+        _note, cdir = _validate_chart(df, {
+            "chart_type": c.get("chart_type"), "x_column": c.get("x_column"),
+            "y_columns": c.get("y_columns"), "size_column": c.get("size_column"),
+            "chart_title": c.get("title"),
+        })
         charts_out.append({
-            "chart_type": ct, "x_column": x, "y_columns": ys,
-            "title": (c.get("title") or "").strip() or None,
+            "chart_type": cdir["chart_type"], "x_column": cdir["x_column"],
+            "y_columns": cdir["y_columns"], "size_column": cdir.get("size_column"),
+            "title": cdir.get("title"),
         })
 
     if not kpis_out and not charts_out:
         raise OperationError("A dashboard needs at least one KPI or chart.")
+
+    # ACCURATE written summary (DoD 2.3): built from the TRUSTED KPI figures + the real
+    # row count, so every number is computed here — never a model-invented figure. Any
+    # Brain-provided narrative rides ALONGSIDE the trusted facts, never replacing them.
+    narrative = (op.get("summary") or "").strip()
+    facts = [f"{k['label']}: {k['value']}" for k in kpis_out if k["value"] != "—"]
+    parts: list[str] = []
+    if narrative:
+        parts.append(narrative)
+    if facts:
+        parts.append("By the numbers — " + "; ".join(facts) + ".")
+    parts.append(f"Computed from {len(df):,} row{'s' if len(df) != 1 else ''} of data.")
+    summary_text = " ".join(parts)
 
     directive = {
         "type": "dashboard",
         "title": (op.get("dashboard_title") or "").strip() or "Dashboard",
         "kpis": kpis_out,
         "charts": charts_out,
-        "summary": (op.get("summary") or "").strip(),
+        "summary": summary_text,
         "rows": int(len(df)),
     }
     note = (
@@ -125,4 +130,12 @@ def dashboard(df: pd.DataFrame, op: dict) -> tuple[str, dict]:
         f"{'' if len(kpis_out) == 1 else 's'} and {len(charts_out)} chart"
         f"{'' if len(charts_out) == 1 else 's'} on a new 'Dashboard' sheet."
     )
+    if uncomputable:
+        note += (f" ({uncomputable} KPI{'s' if uncomputable != 1 else ''} couldn't be "
+                 "computed from this data and show '—'.)")
     return note, directive
+
+
+def _require(df: pd.DataFrame, column: str) -> None:
+    from .base import require_columns
+    require_columns(df, [column])

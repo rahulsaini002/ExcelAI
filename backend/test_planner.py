@@ -208,19 +208,38 @@ except MultiStepError as e:
 
 # API-level partial failure: should return ok + partial=True + warning
 try:
+    # Pre-flight validation (Phase 1.1 / DoD): a defect KNOWN up front — a column that
+    # exists nowhere — is clarified BEFORE anything runs; partial execution is reserved
+    # for failures that only MANIFEST at runtime (next block).
     main.llm.parse_instruction = lambda i, s, h: {
         "operations": [
             {"action": "remove_duplicates", "columns": ["Region"]},
             {"action": "sort", "columns": ["NoSuchColumn"], "orders": ["asc"]},
         ],
+    }
+    r = client.post(
+        "/process",
+        data={"instruction": "dedupe then sort bad col", "session_id": "p34pre", "rewind": "-1", "history": ""},
+        files=[("files", ("d.csv", b"Region,Revenue\nNorth,500\nNorth,700\nSouth,300\n", "text/csv"))],
+    )
+    check("P34-d known-bad column -> clarify BEFORE running (validation-first)",
+          r.status_code == 200 and r.json().get("status") == "clarify", r.text[:160])
+
+    # Runtime partial failure: every referenced column EXISTS (pre-flight passes), but
+    # step 2's arithmetic on a text column fails during execution -> partial result.
+    main.llm.parse_instruction = lambda i, s, h: {
+        "operations": [
+            {"action": "remove_duplicates", "columns": ["Region"]},
+            {"action": "add_formula_column", "name": "Double", "formula": "{Region} * 2"},
+        ],
         "steps": [
             {"label": "Remove duplicate regions"},
-            {"label": "Sort by NoSuchColumn"},
+            {"label": "Double the region (fails at runtime)"},
         ],
     }
     r = client.post(
         "/process",
-        data={"instruction": "dedupe then sort bad col", "session_id": "p34d", "rewind": "-1", "history": ""},
+        data={"instruction": "dedupe then double region", "session_id": "p34d", "rewind": "-1", "history": ""},
         files=[("files", ("d.csv", b"Region,Revenue\nNorth,500\nNorth,700\nSouth,300\n", "text/csv"))],
     )
     body = r.json()

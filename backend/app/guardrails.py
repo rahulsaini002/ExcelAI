@@ -38,7 +38,49 @@ def _formula_refs(operations: list[dict], column: str) -> int:
     )
 
 
-def _assess_op(step: int, op: dict, df: pd.DataFrame | None, operations: list[dict]) -> dict | None:
+def _refs_in(formula: str) -> set[str]:
+    """Column names a formula template references. Handles {Col}, {Col:} (range) and
+    {Sheet.Col:} — normalised to the bare column name for dependency matching."""
+    out: set[str] = set()
+    for inner in re.findall(r"\{([^{}]+)\}", formula or ""):
+        text = inner.strip().rstrip(":").strip()
+        if "." in text:                       # {Sheet.Col} → the column part
+            text = text.split(".", 1)[1].strip()
+        if text:
+            out.add(text)
+    return out
+
+
+def _known_dependents(
+    known_formulas: dict | None, target_cols, dropping: set | frozenset = frozenset()
+) -> list[str]:
+    """Names of EXISTING (prior-step) formula columns that reference any of `target_cols`
+    — real trace-precedents across the session, not just the current plan. Skips any
+    formula whose own column is itself being removed in this op (it can't be "broken" if
+    it's going away). This is what powers the honest "feeds N formulas" impact."""
+    if not known_formulas:
+        return []
+    targets = {str(c) for c in target_cols}
+    dropping = {str(c) for c in dropping}
+    out: list[str] = []
+    for name, formula in known_formulas.items():
+        if name in dropping:
+            continue
+        if _refs_in(formula) & targets:
+            out.append(str(name))
+    return out
+
+
+def _feeds_clause(names: list[str]) -> str:
+    """' — feeds N existing formula(s): a, b' or '' when nothing depends on it."""
+    if not names:
+        return ""
+    return (f" — feeds {len(names)} existing formula{'s' if len(names) != 1 else ''}: "
+            f"{', '.join(names)}")
+
+
+def _assess_op(step: int, op: dict, df: pd.DataFrame | None, operations: list[dict],
+               known_formulas: dict | None = None) -> dict | None:
     action = op.get("action")
     cols = op.get("columns") or []
     n = len(df) if df is not None else 0
@@ -51,7 +93,9 @@ def _assess_op(step: int, op: dict, df: pd.DataFrame | None, operations: list[di
             present = [c for c in cols if df is not None and c in df.columns] or cols
             refs = sum(_formula_refs(operations, c) for c in present)
             extra = f" (used by {refs} formula step{'s' if refs != 1 else ''} in this plan)" if refs else ""
-            return warn("high", f"Deletes {len(present)} column{'s' if len(present) != 1 else ''}: {', '.join(present)}{extra}.")
+            feeds = _feeds_clause(_known_dependents(
+                known_formulas, present, dropping={str(x) for x in cols} | set(present)))
+            return warn("high", f"Deletes {len(present)} column{'s' if len(present) != 1 else ''}: {', '.join(present)}{extra}{feeds}.")
 
         if action == "select_columns":
             if df is None:
@@ -135,7 +179,8 @@ def _assess_op(step: int, op: dict, df: pd.DataFrame | None, operations: list[di
             if df is not None and name in df.columns and op.get("overwrite"):
                 refs = _formula_refs(operations, name)
                 extra = f" (used by {refs} formula step{'s' if refs != 1 else ''} in this plan)" if refs else ""
-                return warn("high", f"Overwrites the existing column '{name}'{extra}.")
+                feeds = _feeds_clause(_known_dependents(known_formulas, [name], dropping={name}))
+                return warn("high", f"Overwrites the existing column '{name}'{extra}{feeds}.")
             return None
 
         if action == "rename_columns":
@@ -145,7 +190,11 @@ def _assess_op(step: int, op: dict, df: pd.DataFrame | None, operations: list[di
             refs = sum(_formula_refs(operations, a) for a, _ in pairs)
             detail = ", ".join(f"{a}→{b}" for a, b in pairs)
             extra = f" — affects {refs} formula step{'s' if refs != 1 else ''} in this plan" if refs else ""
-            return warn("medium" if refs else "low", f"Renames {detail}{extra}.")
+            dependents = _known_dependents(known_formulas, [a for a, _ in pairs])
+            feeds = _feeds_clause(dependents)
+            # Renaming a column that EXISTING formulas depend on is a real break → high.
+            sev = "high" if dependents else ("medium" if refs else "low")
+            return warn(sev, f"Renames {detail}{extra}{feeds}.")
 
         if action in _RESHAPES:
             label = {"merge": "Merges tables into one", "combine_sheets": "Combines tables onto separate sheets",
@@ -162,17 +211,23 @@ def _assess_op(step: int, op: dict, df: pd.DataFrame | None, operations: list[di
     return None
 
 
-def assess(operations: list[dict], tables: dict, primary: str) -> dict:
+def assess(operations: list[dict], tables: dict, primary: str,
+           known_formulas: dict | None = None) -> dict:
     """Return {destructive, warnings, summary}. `destructive` is True when any warning is
     high/medium severity (worth a confirmation). Row-based numbers for chained plans are
-    estimated against the starting table."""
+    estimated against the starting table.
+
+    `known_formulas` = {column: formula} the SESSION has already built (prior steps). It
+    lets drop/rename/overwrite warnings trace real precedents — "feeds 3 existing formulas:
+    Margin, GM, Runway" — not just references inside the current plan. Optional and
+    defaulting to none, so every existing caller is unaffected."""
     df0 = tables.get(primary)
     working = primary
     warnings: list[dict] = []
     for i, op in enumerate(operations, 1):
         tname = op.get("table") or working
         df = tables.get(tname, df0)
-        w = _assess_op(i, op, df, operations)
+        w = _assess_op(i, op, df, operations, known_formulas)
         if w:
             warnings.append(w)
         if op.get("action") not in ("merge", "combine_sheets"):

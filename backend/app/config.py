@@ -22,6 +22,12 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 #   "xlookup"     — =XLOOKUP(...); needs Excel 2021/365 or Google Sheets.
 LOOKUP_STYLE = os.getenv("SUMIO_LOOKUP_STYLE", "index_match").strip().lower()
 
+# Pivot summary style when the user doesn't say (Phase 2.1):
+#   "static" — trusted pandas computes the grid; works everywhere (default, safest).
+#   "live"   — saved .xlsx gets a live =GROUPBY()/=PIVOTBY() spill formula;
+#              needs Microsoft 365 (the response note warns about this).
+PIVOT_STYLE = os.getenv("SUMIO_PIVOT_STYLE", "static").strip().lower()
+
 # --- Pre-deploy hardening (all OFF by default so local dev + tests are unaffected) ----
 #   API_TOKEN    — when set, every request must send it (header `X-API-Key: <token>` or
 #                  `Authorization: Bearer <token>`). /health is always exempt. Genuinely

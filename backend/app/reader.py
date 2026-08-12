@@ -143,14 +143,18 @@ def load_spreadsheet(data: bytes, filename: str) -> LoadedSheet:
         df = _name_blank_columns(_fix_header(_clean_columns(raw)))
         return LoadedSheet(df=df, filename=filename, ext="csv", sheets={"Sheet1": df})
 
-    if name.endswith(".xlsx") or name.endswith(".xlsm") or name.endswith(".xls"):
+    if name.endswith((".xlsx", ".xlsm", ".xls", ".ods")):
+        # Phase 1.10: .xls arrives via xlrd, .ods via odfpy — pandas picks the engine
+        # from the extension; every format lands in the same {name: DataFrame} dict.
+        engine = "odf" if name.endswith(".ods") else None
         try:
             # sheet_name=None reads every sheet into a {name: DataFrame} dict.
-            all_sheets = pd.read_excel(io.BytesIO(data), sheet_name=None)
+            all_sheets = pd.read_excel(io.BytesIO(data), sheet_name=None, engine=engine)
         except Exception as exc:
+            kind = "OpenDocument" if engine == "odf" else "Excel"
             raise ValueError(
                 f"Couldn't read '{filename}' — it may be corrupted or not a real "
-                "Excel file. Try opening it in Excel and re-saving."
+                f"{kind} file. Try opening it and re-saving."
             ) from exc
         sheets = {
             str(n): _name_blank_columns(_fix_header(_clean_columns(d)))
@@ -160,8 +164,8 @@ def load_spreadsheet(data: bytes, filename: str) -> LoadedSheet:
         return LoadedSheet(df=first, filename=filename, ext="xlsx", sheets=sheets)
 
     raise ValueError(
-        "Unsupported file type. Please upload an Excel (.xlsx, .xlsm, .xls), CSV, "
-        "PDF, or image file."
+        "Unsupported file type. Please upload an Excel (.xlsx, .xlsm, .xls), "
+        "OpenDocument (.ods), CSV, PDF, or image file."
     )
 
 
@@ -202,6 +206,29 @@ _IMAGE_MIME: dict[str, str] = {
 }
 
 
+def _extract_or_explain(extract, filename: str, *args):
+    """Run a PDF/image extractor, turning an UNEXPECTED failure into a friendly, actionable
+    message instead of an opaque 500 (PRD 1.1-h/1.1-i).
+
+    A corrupt image, an OCR hiccup, or a missing API key used to escape as a bare exception,
+    which the endpoints reported as "Something went wrong on our side" — blaming the system
+    and telling the user nothing. ValueError (a real "no table found" verdict) and
+    ModelUnavailableError (rate-limit/outage, which callers translate to 503) pass through
+    untouched, so only genuinely unexpected failures are reworded."""
+    from . import llm  # deferred: llm imports config/network bits
+
+    try:
+        return extract(filename, *args)
+    except (ValueError, llm.ModelUnavailableError):
+        raise
+    except Exception:
+        raise ValueError(
+            f"I couldn't read a table out of '{filename}'. If it's a spreadsheet, please "
+            "upload it as .xlsx, .xlsm, .xls or .csv. If it's a photo or scan of a table, "
+            "try a clearer, well-lit image."
+        )
+
+
 def load_files(files: list[tuple[str, bytes]]) -> LoadedData:
     """Load several uploaded files into one namespace of named tables.
 
@@ -223,7 +250,7 @@ def load_files(files: list[tuple[str, bytes]]) -> LoadedData:
 
         if suffix in _PDF_EXTS:
             # PDF: pdfplumber first, Gemini Vision OCR fallback.
-            extracted = pdf_reader.load_pdf(filename, data)
+            extracted = _extract_or_explain(pdf_reader.load_pdf, filename, data)
             for label, df, note in extracted:
                 label = _unique_name(label, tables)
                 tables[label] = df
@@ -236,7 +263,7 @@ def load_files(files: list[tuple[str, bytes]]) -> LoadedData:
         elif suffix in _IMAGE_EXTS:
             # Image: Gemini Vision OCR.
             mime = _IMAGE_MIME.get(suffix, "image/png")
-            extracted = pdf_reader.load_image(filename, data, mime)
+            extracted = _extract_or_explain(pdf_reader.load_image, filename, data, mime)
             for label, df, note in extracted:
                 label = _unique_name(label, tables)
                 tables[label] = df

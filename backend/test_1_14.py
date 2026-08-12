@@ -195,12 +195,17 @@ try:
 finally:
     restore()
 
-# a bad column name is explained, not crashed (still 422, names the column)
+# a bad column name is explained, not crashed. Since Phase 0.3 the plan validator
+# catches this PRE-FLIGHT: a friendly clarify naming the column (and listing the
+# real ones) instead of a runtime 422 — validation-first, per the DoD.
 try:
     stub_parse({"operations": [{"action": "sort", "columns": ["Nope"], "orders": ["asc"]}]})
     r = post("sort by Nope")
     body = r.json()
-    check("1.14-e bad column -> friendly 422", r.status_code == 422 and "Nope" in body["error"] and not looks_technical(body["error"]), str(body)[:200])
+    friendly = body.get("clarification") or ""
+    check("1.14-e bad column -> pre-flight clarify (not a crash)",
+          body.get("status") == "clarify" and "Nope" in friendly and not looks_technical(friendly),
+          str(body)[:200])
 finally:
     restore()
 

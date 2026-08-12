@@ -15,8 +15,15 @@ def _sort_key(series: pd.Series) -> pd.Series:
     """Return a sort key so values order by meaning, not text.
 
     Numbers (even when stored as text) sort numerically, dates chronologically,
-    and plain text alphabetically but case-insensitively. Applied per sort column
-    by pandas' sort_values(key=...). Blanks stay blank so they sort to the end.
+    and plain text alphabetically, ignoring case AND surrounding whitespace. Applied
+    per sort column by pandas' sort_values(key=...). Blanks stay blank so they sort
+    to the end.
+
+    Trimming matters as much as lower-casing: real sheets are full of stray spaces, and
+    ' East' / 'East' / 'EAST' look identical to a user. Keying on the raw text scattered
+    those across the sheet, which defeats the point of sorting — and disagreed with the
+    rest of the engine, where lookups and de-duplication already match keys trimmed and
+    case-folded. Only the sort KEY is normalized; the cell values are never altered.
     """
     if pd.api.types.is_numeric_dtype(series) or pd.api.types.is_datetime64_any_dtype(series):
         return series
@@ -28,7 +35,8 @@ def _sort_key(series: pd.Series) -> pd.Series:
         dates = to_datetime(series)
         if int(dates.notna().sum()) == nonnull:  # every value is a date
             return dates
-    return series.astype("string").str.lower()  # case-insensitive text (keeps <NA>)
+    # case- and whitespace-insensitive text (keeps <NA> so blanks still sort last)
+    return series.astype("string").str.strip().str.lower()
 
 
 def sort(df: pd.DataFrame, op: dict) -> tuple[pd.DataFrame, str]:
@@ -43,8 +51,20 @@ def sort(df: pd.DataFrame, op: dict) -> tuple[pd.DataFrame, str]:
     require_columns(df, columns)
 
     orders = op.get("orders") or []
-    # Default any unspecified order to ascending.
-    ascending = [(orders[i] if i < len(orders) else "asc") != "desc" for i in range(len(columns))]
+    # Default any unspecified order to ascending. Orders arrive as free text now (the
+    # schema enum was dropped for serving-size reasons) — normalize "desc"/"descending"
+    # etc., and refuse anything unrecognizable rather than silently sorting ascending.
+    ascending: list[bool] = []
+    for i in range(len(columns)):
+        o = str(orders[i] if i < len(orders) else "asc").strip().lower()
+        if o.startswith("desc"):
+            ascending.append(False)
+        elif o.startswith("asc") or o == "":
+            ascending.append(True)
+        else:
+            raise OperationError(
+                f"I don't understand the sort order '{o}' — use ascending or descending."
+            )
 
     # Blanks always sorted to the end, regardless of direction.
     df = df.sort_values(
