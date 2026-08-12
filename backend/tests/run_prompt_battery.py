@@ -71,6 +71,7 @@ os.environ["DATABASE_URL"] = "sqlite:///" + _db.replace("\\", "/")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+from app import llm  # noqa: E402
 from app.db import init_db  # noqa: E402
 from app.main import app  # noqa: E402
 
@@ -223,7 +224,13 @@ def main() -> int:
         return 1
 
     print(f"Prompt battery: {len(selected)} of {len(rows)} rows "
-          f"(workbook: {wb_path.name}, {'Gemini' if os.getenv('GEMINI_API_KEY') else 'NO API KEY — offline fallback only'})\n")
+          f"(workbook: {wb_path.name}, {'Gemini' if os.getenv('GEMINI_API_KEY') else 'NO API KEY — offline fallback only'})")
+    # Which Brain produced this run (Track 3 item 7). A pass-rate is only comparable to
+    # another pass-rate from the SAME prompt and model, so stamp it on every run — record
+    # this line with the results or a later comparison is guesswork.
+    ident = llm.prompt_identity()
+    print(f"Brain: prompt {ident['prompt_version']} (fingerprint {ident['prompt_fingerprint']}) "
+          f"· model {ident['model']}\n")
 
     per_area: dict[str, list[bool]] = defaultdict(list)
     failed_rows: list[tuple[int, dict, list[str]]] = []

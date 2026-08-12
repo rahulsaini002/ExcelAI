@@ -311,6 +311,17 @@ def health() -> dict:
     return {"status": "ok", "model": config.MODEL}
 
 
+@app.get("/brain/version")
+def brain_version() -> dict:
+    """Which prompt + model the Brain is currently running (Track 3 item 7).
+
+    Record this alongside any battery run: a pass-rate is only comparable to another
+    pass-rate produced by the same prompt. `prompt_fingerprint` is computed from the
+    prompt text, so it stays truthful even if PROMPT_VERSION wasn't bumped.
+    """
+    return llm.prompt_identity()
+
+
 def _abbrev(x: float) -> str:
     """Compact human number: 4,820,000 -> 4.82M, 18204 -> 18.2K."""
     ax = abs(x)
@@ -960,6 +971,44 @@ def _missing_columns_clarification(missing: list[str], tables: dict) -> str:
     )
 
 
+# Above this many total rows we skip relationship detection when building the Brain's
+# context. kg._valset normalizes EVERY value of a column (no sampling), so on a big
+# multi-sheet workbook that is a full scan per column per table on every /parse call.
+# Detecting on a sample instead would make `coverage` approximate, and an approximate
+# foreign key is a hint that can be WRONG — so we omit the section entirely rather than
+# hand the Brain something it might act on. Silence is honest; a bad hint is not.
+_REL_MAX_ROWS = 50_000
+
+
+def _brain_structure(tables: dict, primary: str) -> dict:
+    """The structure sent to the Brain: reader.summarize_tables (column names, inferred
+    types, sample rows, row counts, primary table) PLUS detected sheet relationships.
+
+    Relationships are the foreign keys a workbook has but never declares. Without them
+    the Brain sees several tables and no idea how they connect, so a cross-sheet request
+    ("bring in each sale's customer email") has to be guessed at. kg.relationships only
+    asserts a link when the values genuinely line up, so anything listed here is real.
+
+    Note this enriches the Brain's INPUT context, not the response schema — no schema
+    cliff risk.
+    """
+    structure = summarize_tables(tables, primary)
+    if len(tables) < 2:
+        return structure  # a single sheet has nothing to relate to
+    if scale.total_rows(tables) > _REL_MAX_ROWS:
+        return structure
+    try:
+        rels = kg.relationships(tables)
+    except Exception:
+        # Context enrichment must never break a request that would otherwise work.
+        return structure
+    if rels:
+        structure["relationships"] = [
+            {k: v for k, v in r.items() if k != "name_match"} for r in rels
+        ]
+    return structure
+
+
 def _sane_plan(plan: object) -> dict:
     """Guard against MALFORMED Brain output (PRD 1.3): the parser must hand back a dict
     of {operations?, clarification?, reply?, ...}. Raw text, a list, None, or a plan
@@ -1016,7 +1065,7 @@ async def parse(
         return _error("Please upload a spreadsheet to start.", status=400)
     base = entry["states"][-1]
     tables, primary = base["tables"], base["primary"]
-    structure = summarize_tables(tables, primary)
+    structure = _brain_structure(tables, primary)
     # PII shield (3.9): mask sensitive sample values + history BEFORE the model sees them.
     structure, shielded = pii.redact_structure(structure, pii.scan_tables(tables))
     history = pii.redact_text(history)
@@ -1421,8 +1470,10 @@ async def process(
 
     tables, primary, exts = base["tables"], base["primary"], base["exts"]
 
-    # 2. Summarize all tables for the model so it can plan across files.
-    structure = summarize_tables(tables, primary)
+    # 2. Summarize all tables for the model so it can plan across files, including the
+    #    foreign-key links between them (Track 3 item 1) so cross-sheet requests don't
+    #    have to be guessed at.
+    structure = _brain_structure(tables, primary)
     # PII shield (3.9): mask sensitive sample values + history BEFORE the model sees them.
     # Compliance profiles (5.5) WIDEN the scan with regime-specific fields (HIPAA MRN, IRDAI
     # policy no, …) so they're masked too; with none set, this is the base shield unchanged.

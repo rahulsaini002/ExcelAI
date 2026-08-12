@@ -10,6 +10,7 @@ structured "operation plan". It never sees or touches the file itself.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 import time
@@ -397,6 +398,17 @@ operation runs on the current working table (the "primary_table" at the start, o
 the result of the previous operation). Use "table" when the user names a specific \
 file/sheet. Use "merge" to combine tables, and "lookup" to pull values from \
 another table.
+
+RELATIONSHIPS: when several tables are present the structure may carry a \
+"relationships" list — the foreign-key links between them, detected by checking that \
+the values genuinely line up (each entry gives from_table/from_column -> \
+to_table/to_column and the coverage that was measured). Use these as the JOIN KEYS for \
+"lookup": if the user asks for a field that lives in a related table ("bring in each \
+sale's customer email"), the relationship tells you which columns connect the two, so \
+you can emit the lookup instead of asking which columns to match on. A relationship is \
+only listed when the data supports it, so you may trust it — but its ABSENCE means no \
+link was detected, NOT that you should invent one. If no relationship connects the \
+tables the user's request spans, ask rather than guessing at the join.
 
 You can ONLY use these operations:
 
@@ -953,6 +965,46 @@ one sentence explaining the OVERALL approach, e.g. "Filter first to reduce the d
 then aggregate for a focused summary." Omit for single-operation plans.
 - Otherwise leave "clarification" and "reply" empty/null.
 """
+
+# --- Prompt versioning (Track 3 item 7) -----------------------------------------------
+# The Brain's behavior is decided almost entirely by SYSTEM_PROMPT, and a live battery
+# result is only interpretable if you know WHICH prompt produced it. Stage 0.3 made the
+# cost of not having this concrete: two rules were verified in English, the prompt was
+# edited later, and there was no way to tell from a stored result which wording it had
+# been run against.
+#
+# Two identifiers, because they fail differently:
+#   PROMPT_VERSION      hand-maintained, human-meaningful. Says what CHANGED and when.
+#                       Bump it whenever you edit SYSTEM_PROMPT.
+#   prompt_fingerprint  computed from the text itself. Cannot be forgotten, so it is the
+#                       one to trust when the two disagree — a stale PROMPT_VERSION with a
+#                       changed fingerprint means someone edited the prompt without
+#                       bumping, and any comparison across that boundary is invalid.
+#
+# History:
+#   2026-08-09.1  original Stage 0.3 fixes (tie rule, unsupported-request rule)
+#   2026-08-12.1  tie/unsupported rules made language-independent: removed the
+#                 chart-section contradiction about sparklines, moved the clarify
+#                 carve-out into the prefer-to-act bullet, added the mandatory
+#                 pre-flight tie check + "language does not change the rules"
+#   2026-08-12.2  Track 3 item 1: documented the "relationships" context block
+PROMPT_VERSION = "2026-08-12.2"
+
+
+def prompt_fingerprint() -> str:
+    """Short stable hash of the actual prompt text. Changes whenever SYSTEM_PROMPT does,
+    whether or not anyone remembered to bump PROMPT_VERSION."""
+    return hashlib.sha256(SYSTEM_PROMPT.encode("utf-8")).hexdigest()[:12]
+
+
+def prompt_identity() -> dict:
+    """What produced a given Brain answer — attach to results so a battery run months
+    from now is still traceable to an exact prompt and model."""
+    return {
+        "prompt_version": PROMPT_VERSION,
+        "prompt_fingerprint": prompt_fingerprint(),
+        "model": config.MODEL,
+    }
 
 
 def _client() -> genai.Client:

@@ -29,6 +29,7 @@ longer run:
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -71,6 +72,32 @@ def describe(exc: BaseException) -> tuple[object, object, str]:
     return None, None, f"{type(exc).__name__}: {str(exc)[:200]}"
 
 
+def quota_detail(exc: BaseException) -> tuple[str, str]:
+    """Pull (quotaId, retryDelay) out of a 429 body.
+
+    Google returns BOTH per-minute and per-day exhaustion as 429 RESOURCE_EXHAUSTED, so
+    the status code alone cannot tell them apart. The quotaId can:
+      GenerateRequestsPerMinute...   short burst limit, seconds from clearing
+      GenerateRequestsPerDay...      the daily allowance
+
+    Crucially, a PerDay 429 STILL carries a retryDelay. Observed 2026-08-12: the 20/day
+    flash-lite allowance was exhausted, the body said "Please retry in 45.3s", and a
+    retry DID succeed. So the daily allowance trickles back instead of hard-locking
+    until midnight. Never report a 429 as "nothing more today" when a retryDelay is
+    present — say how long to wait.
+    """
+    text = ""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        text += str(cur)
+        cur = cur.__cause__
+    qid = re.search(r"'quotaId':\s*'([^']+)'", text)
+    delay = re.search(r"'retryDelay':\s*'([^']+)'", text) or re.search(r"retry in ([\d.]+)s", text)
+    return (qid.group(1) if qid else ""), (delay.group(1) if delay else "")
+
+
 def probe(model: str) -> bool:
     """One call on `model`. Returns True if the bucket is usable."""
     os.environ["SUMIO_MODEL"] = model
@@ -84,7 +111,16 @@ def probe(model: str) -> bool:
     except Exception as exc:  # noqa: BLE001 — classifying is the whole point
         code, status, detail = describe(exc)
         if code == 429 or status == "RESOURCE_EXHAUSTED":
-            verdict = "429 DAILY BUCKET SPENT — waiting will not help today"
+            qid, delay = quota_detail(exc)
+            scope = "per-day" if "PerDay" in qid else ("per-minute" if "PerMinute" in qid else "unknown-scope")
+            if delay:
+                verdict = f"429 {scope} quota hit — retry in {delay} (NOT locked out; it replenishes)"
+            else:
+                verdict = f"429 {scope} quota hit — no retryDelay given"
+            if qid:
+                print(f"  {model:26s} {verdict}")
+                print(f"      quotaId: {qid}")
+                return False
         elif code == 503 or status == "UNAVAILABLE":
             verdict = "503 HIGH DEMAND — bucket NOT spent, retry is worthwhile"
         else:
@@ -120,5 +156,11 @@ if __name__ == "__main__":
         print(f"{len(usable)} of {len(models)} usable: {', '.join(usable)}")
         print(f"Pin one for a live slice:  $env:SUMIO_MODEL=\"{usable[0]}\"")
     else:
-        print("No usable bucket. Free tier resets at midnight US-Pacific = 12:30 PM IST.")
+        print("No bucket answered right now.")
+        print("A 429 with a retryDelay is NOT a hard lockout — the free-tier allowance")
+        print("replenishes, and a SINGLE call may well get through on a retry.")
+        print("But once the daily 20 is spent the trickle is far too slow to carry a")
+        print("multi-call suite: measured 2026-08-12, two single-case runs each burned")
+        print("~240s of backoff and still failed. Treat a spent day as done, and run")
+        print("matrices after the hard reset at midnight US-Pacific = 12:30 PM IST.")
     sys.exit(0 if usable else 1)
