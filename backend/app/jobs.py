@@ -35,6 +35,7 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
 from . import config
+from .executor import OperationCancelled
 
 # Job states. The first two are live, the last three terminal — and they deliberately
 # mirror the outcome vocabulary oplog.record_outcome already uses.
@@ -43,7 +44,8 @@ RUNNING = "running"
 OK = "ok"
 PARTIAL = "partial"   # a later step failed; earlier steps are kept (MultiStepError, MS-b)
 ERROR = "error"
-TERMINAL = (OK, PARTIAL, ERROR)
+TIMEOUT = "timeout"   # ran past its deadline and was stopped between steps (item 6)
+TERMINAL = (OK, PARTIAL, ERROR, TIMEOUT)
 
 # Coarse milestones inside a run, in the order they happen. "saving" is a real phase, not
 # padding: serializing a 120k-row workbook to .xlsx is a large share of the wall clock.
@@ -83,14 +85,42 @@ class Progress:
     Every method is best-effort and swallows its own errors: progress reporting must never
     be able to fail a real execution. A vanished job (evicted mid-run — shouldn't happen,
     since running jobs aren't evicted) simply reports nowhere.
+
+    The ONE exception is the deadline (item 6): `step` raises OperationCancelled when the
+    budget is spent, which the executor deliberately lets through.
     """
 
-    def __init__(self, job_id: str):
+    def __init__(self, job_id: str, deadline: float | None = None, total_steps: int = 0):
         self.job_id = job_id
+        self.deadline = deadline
+        self.total_steps = total_steps
+
+    def _check_deadline(self, completed: int) -> None:
+        """Stop between steps if the budget is spent.
+
+        WHY BETWEEN STEPS. A worker thread running pandas cannot be safely interrupted
+        mid-operation — Python has no way to abort a C-level sort partway without
+        risking corrupt state — so cancellation is COOPERATIVE and lands at step
+        boundaries. This check runs before EVERY step, the first included, so an
+        already-spent budget stops a run before it does any work at all.
+
+        The honest consequence: a step that has ALREADY BEGUN always runs to completion.
+        A plan of one very long step can therefore overrun its deadline by however long
+        that step takes, and nothing here can stop it. This bounds the number of steps a
+        run will start, not the duration of any single one.
+        """
+        if self.deadline is None or time.time() < self.deadline:
+            return
+        raise OperationCancelled(
+            completed_steps=completed,
+            total_steps=self.total_steps,
+            reason="This took longer than the time budget, so it was stopped.",
+        )
 
     def step(self, index0: int, action: str | None = None) -> None:
         """The executor is ABOUT TO run step `index0` (0-based). Called from
         executor.execute_multi's loop, so it fires only when a step is really reached."""
+        self._check_deadline(index0)
         try:
             with _LOCK:
                 job = _JOBS.get(self.job_id)
@@ -146,6 +176,7 @@ def submit(
     operations: list,
     work,
     pool: ThreadPoolExecutor | None = None,
+    timeout_seconds: float | None = None,
 ) -> dict:
     """Register a job and start `work(progress)` on a worker thread.
 
@@ -167,9 +198,14 @@ def submit(
                 status=409,
             )
         now = time.time()
+        budget = config.JOB_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
         job = {
             "id": job_id,
             "session_id": session_id,
+            # Measured from ACCEPTANCE, not from when a worker picks it up: what the user
+            # experiences is the wait from asking, and queue time is part of that.
+            "deadline": (now + budget) if budget and budget > 0 else None,
+            "timeout_seconds": budget if budget and budget > 0 else None,
             "state": QUEUED,
             "phase": PHASE_QUEUED,
             "total_steps": len(operations or []),
@@ -201,13 +237,15 @@ def _run(job_id: str, work) -> None:
     """The worker-thread body. Nothing that happens in here may escape: an unhandled
     exception on a pool thread would otherwise leave the job stuck in 'running' forever —
     a hung job is worse than a failed one, because nobody knows to stop waiting."""
-    progress = Progress(job_id)
     with _LOCK:
         job = _JOBS.get(job_id)
+        deadline = job.get("deadline") if job else None
+        total = job["total_steps"] if job else 0
         if job:
             job["state"] = RUNNING
             job["started_at"] = time.time()
             job["phase"] = PHASE_EXECUTING
+    progress = Progress(job_id, deadline=deadline, total_steps=total)
     try:
         http_status, body = work(progress)
     except BaseException as exc:  # noqa: BLE001 - deliberately total
@@ -226,7 +264,9 @@ def finish(job_id: str, http_status: int, body: dict) -> dict | None:
     execution path produced, so success / partial / failure can't drift from what a
     synchronous caller would have seen."""
     body = body if isinstance(body, dict) else {}
-    if http_status >= 400 or body.get("status") == "error":
+    if body.get("status") == "timeout" or http_status == 504:
+        state = TIMEOUT
+    elif http_status >= 400 or body.get("status") == "error":
         state = ERROR
     elif body.get("partial"):
         state = PARTIAL
@@ -267,6 +307,16 @@ def finish(job_id: str, http_status: int, body: dict) -> dict | None:
             job["current_action"] = None
             for s in job["steps"]:
                 s["status"] = OK
+        elif state == TIMEOUT:
+            # Stopped between steps, so nothing was half-applied and no state was pushed.
+            # Steps that had finished are still reported as done — that is what actually
+            # happened — but the run as a whole did not take effect.
+            done = int(body.get("completed_steps") or job["completed_steps"])
+            job["completed_steps"] = done
+            for s in job["steps"]:
+                s["status"] = OK if s["index"] <= done else "skipped"
+            job["current_step"] = None
+            job["current_action"] = None
         else:
             for s in job["steps"]:
                 if s["status"] == RUNNING:
@@ -379,6 +429,8 @@ def snapshot(job_id: str) -> dict | None:
             "error": job["error"],
             "result_available": job["body"] is not None,
             "receipt": dict(job["receipt"]),
+            "timeout_seconds": job.get("timeout_seconds"),
+            "timed_out": state == TIMEOUT,
         }
 
 

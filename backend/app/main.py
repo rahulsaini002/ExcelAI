@@ -49,13 +49,15 @@ from openpyxl.utils import get_column_letter
 _PLACEHOLDER = re.compile(r"\{([^{}]+)\}")
 
 from . import (
-    apikeys, audit, auth, collab, compliance, config, connectors, digest, distribution,
-    execsummary, exports, fallback, guardrails, jobs, kg, lineage, llm, marketplace, oidc,
-    oplog, org, permissions, personalization, pii, quality, scale, selfheal, slack, solver,
-    store, sync, voice, workflow,
+    apikeys, audit, auth, collab, compliance, compute_mode, config, connectors, digest,
+    distribution, execsummary, exports, fallback, guardrails, jobs, kg, lineage, llm,
+    marketplace, oidc, oplog, org, permissions, personalization, pii, quality, scale,
+    selfheal, slack, solver, store, sync, voice, workflow,
 )
 from .db import init_db, session_scope
-from .executor import MultiStepError, OperationError, execute_multi, _resolve_sheet_name
+from .executor import (
+    MultiStepError, OperationCancelled, OperationError, execute_multi, _resolve_sheet_name,
+)
 from .operations.base import to_datetime as _to_datetime
 from .reader import load_files, summarize_structure, summarize_tables
 
@@ -309,6 +311,34 @@ _load_results_index()
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok", "model": config.MODEL}
+
+
+@app.get("/operations/compute-mode")
+def operations_compute_mode() -> dict:
+    """The formula-vs-computed-value rule, per operation (Track 4 item 3).
+
+    A live formula recalculates when the user edits the sheet; a computed value is frozen
+    at the moment it ran. Both are legitimate — being unclear about which is not, because
+    someone who assumes a total recalculates when it doesn't will ship a wrong number.
+    """
+    return {
+        "status": "ok",
+        "formula_operations": {
+            "add_formula_column": compute_mode.declared_mode("add_formula_column"),
+            "lookup": compute_mode.declared_mode("lookup"),
+            "pivot_summary": compute_mode.declared_mode("pivot_summary"),
+        },
+        "default": compute_mode.VALUES,
+        "settings": {
+            "lookup_style": config.LOOKUP_STYLE,
+            "pivot_style": config.PIVOT_STYLE,
+        },
+        "note": (
+            "Everything not listed writes computed values. pivot_summary depends on "
+            "SUMIO_PIVOT_STYLE; lookup's formula flavour depends on SUMIO_LOOKUP_STYLE. "
+            "Every run also reports what it actually did in its `computation` field."
+        ),
+    }
 
 
 @app.get("/debug/oplog")
@@ -1295,6 +1325,28 @@ def _run_operations_body(
                 f"Your file reflects the {done} step{'s' if done != 1 else ''} that "
                 "completed before it — fix that step and try again."
             )
+        except OperationCancelled as exc:
+            # Track 4 item 6. Stopped between steps, so NOTHING is pushed to the session:
+            # completed steps existed only in memory and are discarded, leaving the user's
+            # file exactly as it was. Discarding beats half-applying — a partially applied
+            # plan the user didn't ask for and can't see is worse than no change at all.
+            oplog.record_outcome(
+                run_id, status="timeout", rows_before=rows_before,
+                duration_ms=int((time.time() - started_at) * 1000),
+                completed_steps=exc.completed_steps, error=str(exc),
+            )
+            done, total = exc.completed_steps, exc.total_steps or len(operations)
+            return 504, {
+                "status": "timeout",
+                "error": (
+                    f"This took longer than the time budget and was stopped after "
+                    f"{done} of {total} step{'s' if total != 1 else ''}. Your file is "
+                    "unchanged — try a smaller file, or split the request into steps."
+                ),
+                "completed_steps": done,
+                "total_steps": total,
+                "run_id": run_id,
+            }
         except OperationError as exc:
             oplog.record_outcome(
                 run_id, status="error", rows_before=rows_before,
@@ -1383,6 +1435,10 @@ def _run_operations_body(
             "explanation": " ".join(notes) if notes else "No changes were needed.",
             "notes": notes,
             "formulas": _describe_formulas(render_ops),
+            # Track 4 item 3: for EVERY step, whether the file got a live Excel formula or
+            # a computed value — and so whether it recalculates when the user edits the
+            # data. Derived from the directives the run really emitted, not from intent.
+            "computation": compute_mode.describe(operations, render_ops),
             "code": _explain_code(operations),  # Phase 3.3 "Show Code" — mirrors the executed plan
             # Confidence on forecasts/anomalies (Phase 3.10).
             "analysis": [d for d in render_ops if d.get("type") == "analysis"],
@@ -1542,6 +1598,7 @@ async def execute_async(
     rewind: int = Form(-1),
     guard: str = Form("false"),
     confirm: str = Form("false"),
+    timeout_seconds: str = Form(""),
     user: "auth.User | None" = Depends(auth.current_user_optional),
 ) -> JSONResponse:
     """Same as /execute, but returns immediately with a job to watch (Track 4 item 1).
@@ -1579,8 +1636,19 @@ async def execute_async(
             digest.record_run(user.id, summary, body.get("row_count"))
         return status, body
 
+    # Track 4 item 6: a caller may ask for a SHORTER budget than the server default (e.g.
+    # an interactive UI that would rather fail fast), but never a longer one — otherwise a
+    # client could pin a worker indefinitely.
+    budget = config.JOB_TIMEOUT_SECONDS
     try:
-        job = jobs.submit(job_id, session_id, operations, work)
+        want = float(timeout_seconds)
+        if want > 0:
+            budget = min(budget, want) if budget > 0 else want
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        job = jobs.submit(job_id, session_id, operations, work, timeout_seconds=budget)
     except jobs.JobError as exc:
         return _error(str(exc), status=exc.status)
 
@@ -1591,6 +1659,7 @@ async def execute_async(
             "run_id": job["id"],
             "session_id": session_id,
             "total_steps": job["total_steps"],
+            "timeout_seconds": job["timeout_seconds"],
             "poll": f"/jobs/{job['id']}",
             "result": f"/jobs/{job['id']}/result",
         },
@@ -1901,6 +1970,10 @@ async def process(
             "explanation": " ".join(notes) if notes else "No changes were needed.",
             "notes": notes,
             "formulas": _describe_formulas(render_ops),
+            # Track 4 item 3: for EVERY step, whether the file got a live Excel formula or
+            # a computed value — and so whether it recalculates when the user edits the
+            # data. Derived from the directives the run really emitted, not from intent.
+            "computation": compute_mode.describe(operations, render_ops),
             "code": _explain_code(operations),  # Phase 3.3 "Show Code" — mirrors the executed plan
             # Spoken feedback (Phase 3.6): a TTS-ready line shaped to the user's chosen
             # verbosity (silent/step/summary). null in silent mode. Purely a view over

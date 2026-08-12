@@ -68,6 +68,25 @@ _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 _NON_SHEET = re.compile(r"[:\\/?*\[\]]")
 
 
+class OperationCancelled(Exception):
+    """The caller asked to stop between steps (Track 4 item 6 — a job deadline).
+
+    Distinct from an operation FAILING: nothing about the data was wrong, we simply ran
+    out of the time budget. It carries how far we had got so the caller can say "stopped
+    after step 2 of 5" instead of just "timed out".
+
+    This is the ONE exception `on_step` is allowed to raise. The progress-callback guard
+    swallows everything else — a broken reporter must never fail a real execution — but a
+    deliberate cancellation has to be able to get out, so it is re-raised.
+    """
+
+    def __init__(self, completed_steps: int, total_steps: int, reason: str = ""):
+        super().__init__(reason or "The run was stopped before it finished.")
+        self.completed_steps = completed_steps  # steps fully done before stopping
+        self.total_steps = total_steps
+        self.reason = reason
+
+
 class MultiStepError(Exception):
     """A later step of a multi-step plan failed, but earlier steps succeeded.
 
@@ -245,9 +264,13 @@ def execute_multi(
 
     for step_idx, op in enumerate(operations):
         if on_step is not None:
-            # Best-effort: a progress reporter that throws must not fail a real run.
+            # Best-effort: a progress reporter that throws must not fail a real run —
+            # EXCEPT OperationCancelled, which is the reporter deliberately stopping us
+            # (a job deadline). A reporter may cancel; it may not fail.
             try:
                 on_step(step_idx, (op or {}).get("action"))
+            except OperationCancelled:
+                raise
             except Exception:
                 pass
         try:

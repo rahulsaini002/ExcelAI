@@ -60,9 +60,18 @@ MAX_STATES = int(os.getenv("SUMIO_MAX_STATES", "30"))
 #                       inline base64 workbook can be several MB). Past the budget the
 #                       oldest finished bodies are dropped but their receipt (download id,
 #                       filename, row count) is kept, so the file is still reachable.
+#   JOB_TIMEOUT_SECONDS time budget for one job, measured from ACCEPTANCE (queue time is
+#                       part of what the user waits). 0 disables it. Cancellation is
+#                       COOPERATIVE and lands at step boundaries — a worker thread running
+#                       pandas cannot be safely interrupted mid-operation. It is checked
+#                       before EVERY step including the first, so a spent budget stops a
+#                       run before it does any work; but a step already BEGUN always runs
+#                       to completion, so a single very long step can overrun. 10 minutes
+#                       is well clear of a legitimate 120k-row multi-step run (~7s).
 JOB_WORKERS = int(os.getenv("SUMIO_JOB_WORKERS", "2"))
 MAX_JOBS = int(os.getenv("SUMIO_MAX_JOBS", "100"))
 MAX_JOB_RESULT_MB = int(os.getenv("SUMIO_MAX_JOB_RESULT_MB", "64"))
+JOB_TIMEOUT_SECONDS = float(os.getenv("SUMIO_JOB_TIMEOUT_SECONDS", "600"))
 
 # Generated result files are written here so downloads (and "continue on the result")
 # survive a backend restart. Kept under MAX_RESULTS_MB and deleted after RESULTS_TTL_HOURS.
