@@ -46,6 +46,10 @@ sys.path.insert(0, str(TESTS.parent))
 _fd, _db = tempfile.mkstemp(suffix="-t41.db")
 os.close(_fd)
 os.environ["DATABASE_URL"] = "sqlite:///" + _db.replace("\\", "/")
+# This suite polls job status in a tight loop (deliberately, to catch mid-run states), so
+# it would trip the default per-IP rate limit within seconds. Opting OUT explicitly here
+# is better than loosening the limit for real users to suit a test.
+os.environ["SUMIO_RATE_LIMIT"] = "0"
 
 import pandas as pd  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402

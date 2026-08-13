@@ -34,10 +34,22 @@ PIVOT_STYLE = os.getenv("SUMIO_PIVOT_STYLE", "static").strip().lower()
 #                  secret for server callers (the Sheets add-on); for the browser app it's
 #                  a coarse gate (the SPA sends it via NEXT_PUBLIC_API_TOKEN).
 #   RATE_LIMIT   — max requests per IP per RATE_WINDOW seconds (0 = unlimited). Protects
-#                  the public AI endpoints from abuse / runaway cost.
+#                  the public AI endpoints from abuse / runaway cost. ON by default now
+#                  (Track 5 item 5): the machinery existed but shipped dormant, which is
+#                  the same as not having it. 300/min is generous for a person driving the
+#                  UI — including the job-status polling, which backs off — while still
+#                  capping a script. Heavy test suites that poll in a tight loop set
+#                  SUMIO_RATE_LIMIT=0 explicitly rather than the default being weakened
+#                  for everyone.
+#   TRUST_PROXY  — whether to believe X-Forwarded-For. OFF by default, because that header
+#                  is client-settable: trusting it blindly let a caller mint a fresh
+#                  rate-limit bucket per request. Turn it ON only when a proxy you control
+#                  (Render/Vercel/nginx) sits in front, and see _client_ip for why the
+#                  LAST hop is the one that gets used.
 API_TOKEN = os.getenv("SUMIO_API_TOKEN", "").strip()
-RATE_LIMIT = int(os.getenv("SUMIO_RATE_LIMIT", "0"))
+RATE_LIMIT = int(os.getenv("SUMIO_RATE_LIMIT", "300"))
 RATE_WINDOW = float(os.getenv("SUMIO_RATE_WINDOW", "60"))
+TRUST_PROXY = os.getenv("SUMIO_TRUST_PROXY", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 # Resource limits, so a single user can't exhaust server memory.
 #   MAX_UPLOAD_MB     — reject uploads whose combined size exceeds this. It's a clean

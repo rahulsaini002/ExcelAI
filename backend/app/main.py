@@ -94,9 +94,29 @@ _RATE: dict[str, list] = {}
 
 
 def _client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for")  # set by Render/Vercel/most proxies
-    if fwd:
-        return fwd.split(",")[0].strip()
+    """The identity the rate limiter counts against.
+
+    X-Forwarded-For is a plain request header: ANY client can send one. Trusting it
+    unconditionally — and taking the LEFTMOST entry, which is the part a client controls —
+    meant a caller could put a different value on every request and get a fresh bucket
+    each time, i.e. no rate limit at all. That is worse than having none, because it looks
+    like protection.
+
+    So the header is only consulted when the deployment says it is behind a proxy
+    (SUMIO_TRUST_PROXY), and then we take the LAST entry: each hop appends, so the
+    rightmost value is the one OUR proxy observed and the client cannot forge past it.
+    Anything a client prepends sits harmlessly to the left.
+
+    Default off is deliberately fail-CLOSED: behind an unconfigured proxy every user
+    shares the proxy's IP and one bucket, which over-limits. Over-limiting is a visible
+    annoyance; a silently bypassable limiter is a security hole.
+    """
+    if config.TRUST_PROXY:
+        fwd = request.headers.get("x-forwarded-for")
+        if fwd:
+            hops = [h.strip() for h in fwd.split(",") if h.strip()]
+            if hops:
+                return hops[-1]
     return request.client.host if request.client else "?"
 
 
@@ -498,6 +518,9 @@ async def dashboard(
         if too_big:
             return _error(too_big, status=413)
         uploads = [(f.filename or "upload", await f.read()) for f in files]
+        too_big = _too_big_read(uploads)  # real bytes; the declared size can be absent
+        if too_big:
+            return _error(too_big, status=413)
         try:
             data = load_files(uploads)
         except ValueError as exc:
@@ -667,6 +690,9 @@ async def report_compute(
     if too_big:
         return _error(too_big, status=413)
     uploads = [(f.filename or "upload", await f.read()) for f in files]
+    too_big = _too_big_read(uploads)  # real bytes; the declared size can be absent
+    if too_big:
+        return _error(too_big, status=413)
     try:
         data = load_files(uploads)
     except ValueError as exc:
@@ -859,6 +885,9 @@ async def inspect(
     if too_big:
         return _error(too_big, status=413)
     uploads = [(f.filename or "upload", await f.read()) for f in files]
+    too_big = _too_big_read(uploads)  # real bytes; the declared size can be absent
+    if too_big:
+        return _error(too_big, status=413)
     try:
         data = load_files(uploads)
     except ValueError as exc:
@@ -1795,6 +1824,9 @@ async def process(
         if too_big:
             return _error(too_big, status=413)
         uploads = [(f.filename or "upload", await f.read()) for f in files]
+        too_big = _too_big_read(uploads)  # real bytes; the declared size can be absent
+        if too_big:
+            return _error(too_big, status=413)
         try:
             data = load_files(uploads)
         except ValueError as exc:
@@ -3309,17 +3341,36 @@ _INTERNAL_ERROR = (
 )
 
 
+def _size_message(total: int) -> str:
+    return (
+        f"That upload is too large (~{total / 1024 / 1024:.0f} MB). "
+        f"Please keep files under {config.MAX_UPLOAD_MB} MB."
+    )
+
+
 def _too_big(files) -> str | None:
-    """Friendly message if the combined upload exceeds the size limit, else None.
-    Guards against a single huge upload exhausting server memory."""
+    """Friendly message if the DECLARED combined upload size exceeds the limit.
+
+    This is the cheap pre-check: it rejects an oversized upload before we read it. It is
+    not sufficient on its own — UploadFile.size can be None when the parser hasn't
+    populated it, and `or 0` then scores the file as empty and lets it through. Pair it
+    with _too_big_read() after the bytes are in hand (Track 5 item 5).
+    """
     limit = config.MAX_UPLOAD_MB * 1024 * 1024
     total = sum((getattr(f, "size", None) or 0) for f in files)
-    if total > limit:
-        return (
-            f"That upload is too large (~{total / 1024 / 1024:.0f} MB). "
-            f"Please keep files under {config.MAX_UPLOAD_MB} MB."
-        )
-    return None
+    return _size_message(total) if total > limit else None
+
+
+def _too_big_read(uploads) -> str | None:
+    """The same limit, measured against the bytes actually read.
+
+    Closes the fail-open path above: whatever the declared size said, this is the real
+    number. Cheap — the bytes are already in memory by this point — and it means an
+    upload with no declared size can no longer slip past the guard.
+    """
+    limit = config.MAX_UPLOAD_MB * 1024 * 1024
+    total = sum(len(b or b"") for _, b in uploads)
+    return _size_message(total) if total > limit else None
 
 
 # --------------------------------------------------------------------------- #
@@ -3998,6 +4049,9 @@ async def quality_check(
         if too_big:
             return _error(too_big, status=413)
         uploads = [(f.filename or "upload", await f.read()) for f in files]
+        too_big = _too_big_read(uploads)  # real bytes; the declared size can be absent
+        if too_big:
+            return _error(too_big, status=413)
         try:
             data = load_files(uploads)
         except ValueError as exc:

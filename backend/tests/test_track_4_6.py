@@ -43,6 +43,8 @@ sys.path.insert(0, str(TESTS.parent))
 _fd, _db = tempfile.mkstemp(suffix="-t46.db")
 os.close(_fd)
 os.environ["DATABASE_URL"] = "sqlite:///" + _db.replace("\\", "/")
+# Polls job status in a tight loop; see the note in test_track_4_1.py.
+os.environ["SUMIO_RATE_LIMIT"] = "0"
 
 import pandas as pd  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
