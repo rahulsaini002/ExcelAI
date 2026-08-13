@@ -51,7 +51,7 @@ _PLACEHOLDER = re.compile(r"\{([^{}]+)\}")
 from . import (
     apikeys, audit, auth, collab, compliance, compute_mode, config, connectors, digest,
     distribution, execsummary, exports, fallback, guardrails, jobs, kg, lineage, llm,
-    marketplace, oidc, oplog, org, permissions, personalization, pii, quality, scale,
+    marketplace, metrics, oidc, oplog, org, permissions, personalization, pii, quality, scale,
     selfheal, slack, solver, store, sync, voice, workflow,
 )
 from .db import init_db, session_scope
@@ -339,6 +339,17 @@ def operations_compute_mode() -> dict:
             "Every run also reports what it actually did in its `computation` field."
         ),
     }
+
+
+@app.get("/metrics/usage")
+def metrics_usage(limit: int = 1000) -> dict:
+    """Where users struggle (Track 5 item 4) — aggregated from the operation log.
+
+    Reports understanding and execution success SEPARATELY (a low first number is a
+    prompt problem, a low second one is an engine problem), retry rate, operation usage,
+    grouped failure reasons, and time-to-result as median/p95 rather than a mean.
+    """
+    return {"status": "ok", "metrics": metrics.summary(limit=limit)}
 
 
 @app.get("/debug/oplog")
@@ -1243,21 +1254,21 @@ async def parse(
 
 def _run_operations(
     session_id: str, base: dict, operations: list[dict], ai_title, started_at: float,
-    progress=None, run_id: str | None = None,
+    progress=None, run_id: str | None = None, retry: bool = False,
 ) -> JSONResponse:
     """Synchronous wrapper: run the plan and render the HTTP response.
 
     The body is produced by _run_operations_body so the async job path (Track 4 item 1)
     can reuse the IDENTICAL execution — see that function's docstring."""
     status, body = _run_operations_body(
-        session_id, base, operations, ai_title, started_at, progress, run_id
+        session_id, base, operations, ai_title, started_at, progress, run_id, retry
     )
     return JSONResponse(body, status_code=status)
 
 
 def _run_operations_body(
     session_id: str, base: dict, operations: list[dict], ai_title, started_at: float,
-    progress=None, run_id: str | None = None,
+    progress=None, run_id: str | None = None, retry: bool = False,
 ) -> tuple[int, dict]:
     """Run an operation plan on a base state, push the new state, serialize, and build
     the OK response BODY. Shared shape with /process (deltas, formulas, preview, partial
@@ -1282,7 +1293,8 @@ def _run_operations_body(
     run_id = run_id or oplog.new_run_id()
     rows_before = sum(int(len(d)) for d in tables.values())
     oplog.record_plan(
-        run_id, session_id=session_id, operations=operations, source="user", status="executing"
+        run_id, session_id=session_id, operations=operations, source="user",
+        status="executing", retry=retry,
     )
 
     partial_warning = None
@@ -1486,7 +1498,9 @@ async def execute(
         return err
     base, operations, ai_title = prep["base"], prep["operations"], prep["ai_title"]
 
-    resp = _run_operations(session_id, base, operations, ai_title, started_at)
+    resp = _run_operations(
+        session_id, base, operations, ai_title, started_at, retry=prep["retry"]
+    )
 
     # Record the run for the weekly digest — ONLY for a signed-in user and ONLY on success
     # (a 200; _run_operations returns 4xx/5xx on failure). Best-effort: digest.record_run
@@ -1588,7 +1602,12 @@ def _prepare_execution(
                 "summary": assessment["summary"],
             }), None
 
-    return None, {"base": base, "operations": operations, "ai_title": ai_title, "entry": entry}
+    # rewind >= 0 means the caller branched from an earlier step — the UI's Retry/Edit.
+    # It is the only signal that someone was dissatisfied enough to go round again.
+    return None, {
+        "base": base, "operations": operations, "ai_title": ai_title, "entry": entry,
+        "retry": rewind is not None and rewind >= 0,
+    }
 
 
 @app.post("/execute/async")
@@ -1627,7 +1646,8 @@ async def execute_async(
 
     def work(progress):
         status, body = _run_operations_body(
-            session_id, base, operations, ai_title, started_at, progress, run_id=job_id
+            session_id, base, operations, ai_title, started_at, progress,
+            run_id=job_id, retry=prep["retry"],
         )
         # Digest parity with the synchronous path: signed-in users, successes only.
         if user is not None and status == 200:

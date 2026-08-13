@@ -75,6 +75,7 @@ def record_plan(
     source: str = "brain",
     status: str = "plan",
     confidence: int | None = None,
+    retry: bool = False,
 ) -> dict:
     """The Brain (or the fallback parser, or a saved workflow) proposed this plan.
 
@@ -90,6 +91,11 @@ def record_plan(
         "source": source,
         "status": status,
         "confidence": confidence,
+        # A re-run of an earlier step (the UI's Retry/Edit, which rewinds history). This
+        # is the only signal that a user was dissatisfied enough to go round again, so it
+        # is what a retry RATE has to be built from — without it, "retry rate" would be a
+        # number with nothing behind it.
+        "retry": bool(retry),
         "instruction": pii.redact_text(instruction or ""),
         "plan": _plan_shape(operations),
     }
