@@ -49,13 +49,15 @@ from openpyxl.utils import get_column_letter
 _PLACEHOLDER = re.compile(r"\{([^{}]+)\}")
 
 from . import (
-    apikeys, audit, auth, collab, compliance, config, connectors, digest, distribution,
-    execsummary, exports, fallback, guardrails, kg, lineage, llm, marketplace, oidc, org,
-    permissions, personalization, pii, quality, scale, selfheal, slack, solver, store, sync,
-    voice, workflow,
+    apikeys, audit, auth, collab, compliance, compute_mode, config, connectors, digest,
+    distribution, execsummary, exports, fallback, guardrails, jobs, kg, lineage, llm,
+    marketplace, metrics, oidc, oplog, org, permissions, personalization, pii, quality, scale,
+    selfheal, slack, solver, store, sync, voice, workflow,
 )
 from .db import init_db, session_scope
-from .executor import MultiStepError, OperationError, execute_multi, _resolve_sheet_name
+from .executor import (
+    MultiStepError, OperationCancelled, OperationError, execute_multi, _resolve_sheet_name,
+)
 from .operations.base import to_datetime as _to_datetime
 from .reader import load_files, summarize_structure, summarize_tables
 
@@ -92,9 +94,29 @@ _RATE: dict[str, list] = {}
 
 
 def _client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for")  # set by Render/Vercel/most proxies
-    if fwd:
-        return fwd.split(",")[0].strip()
+    """The identity the rate limiter counts against.
+
+    X-Forwarded-For is a plain request header: ANY client can send one. Trusting it
+    unconditionally — and taking the LEFTMOST entry, which is the part a client controls —
+    meant a caller could put a different value on every request and get a fresh bucket
+    each time, i.e. no rate limit at all. That is worse than having none, because it looks
+    like protection.
+
+    So the header is only consulted when the deployment says it is behind a proxy
+    (SUMIO_TRUST_PROXY), and then we take the LAST entry: each hop appends, so the
+    rightmost value is the one OUR proxy observed and the client cannot forge past it.
+    Anything a client prepends sits harmlessly to the left.
+
+    Default off is deliberately fail-CLOSED: behind an unconfigured proxy every user
+    shares the proxy's IP and one bucket, which over-limits. Over-limiting is a visible
+    annoyance; a silently bypassable limiter is a security hole.
+    """
+    if config.TRUST_PROXY:
+        fwd = request.headers.get("x-forwarded-for")
+        if fwd:
+            hops = [h.strip() for h in fwd.split(",") if h.strip()]
+            if hops:
+                return hops[-1]
     return request.client.host if request.client else "?"
 
 
@@ -311,6 +333,59 @@ def health() -> dict:
     return {"status": "ok", "model": config.MODEL}
 
 
+@app.get("/operations/compute-mode")
+def operations_compute_mode() -> dict:
+    """The formula-vs-computed-value rule, per operation (Track 4 item 3).
+
+    A live formula recalculates when the user edits the sheet; a computed value is frozen
+    at the moment it ran. Both are legitimate — being unclear about which is not, because
+    someone who assumes a total recalculates when it doesn't will ship a wrong number.
+    """
+    return {
+        "status": "ok",
+        "formula_operations": {
+            "add_formula_column": compute_mode.declared_mode("add_formula_column"),
+            "lookup": compute_mode.declared_mode("lookup"),
+            "pivot_summary": compute_mode.declared_mode("pivot_summary"),
+        },
+        "default": compute_mode.VALUES,
+        "settings": {
+            "lookup_style": config.LOOKUP_STYLE,
+            "pivot_style": config.PIVOT_STYLE,
+        },
+        "note": (
+            "Everything not listed writes computed values. pivot_summary depends on "
+            "SUMIO_PIVOT_STYLE; lookup's formula flavour depends on SUMIO_LOOKUP_STYLE. "
+            "Every run also reports what it actually did in its `computation` field."
+        ),
+    }
+
+
+@app.get("/metrics/usage")
+def metrics_usage(limit: int = 1000) -> dict:
+    """Where users struggle (Track 5 item 4) — aggregated from the operation log.
+
+    Reports understanding and execution success SEPARATELY (a low first number is a
+    prompt problem, a low second one is an engine problem), retry rate, operation usage,
+    grouped failure reasons, and time-to-result as median/p95 rather than a mean.
+    """
+    return {"status": "ok", "metrics": metrics.summary(limit=limit)}
+
+
+@app.get("/debug/oplog")
+def debug_oplog(limit: int = 100, run_id: str = "", phase: str = "") -> dict:
+    """Recent Operation Plans, executions and outcomes (Track 4 item 5).
+
+    Pass `run_id` (returned on every successful /execute) to see one run's plan and
+    outcome together — the view that actually answers a bug report. Records what the
+    system DID: actions, column names, row deltas, durations. Never cell values, and the
+    instruction is stored PII-redacted.
+    """
+    if run_id:
+        return {"run_id": run_id, "events": oplog.run(run_id)}
+    return {"events": oplog.events(limit=limit, phase=phase or None)}
+
+
 @app.get("/brain/version")
 def brain_version() -> dict:
     """Which prompt + model the Brain is currently running (Track 3 item 7).
@@ -443,6 +518,9 @@ async def dashboard(
         if too_big:
             return _error(too_big, status=413)
         uploads = [(f.filename or "upload", await f.read()) for f in files]
+        too_big = _too_big_read(uploads)  # real bytes; the declared size can be absent
+        if too_big:
+            return _error(too_big, status=413)
         try:
             data = load_files(uploads)
         except ValueError as exc:
@@ -612,6 +690,9 @@ async def report_compute(
     if too_big:
         return _error(too_big, status=413)
     uploads = [(f.filename or "upload", await f.read()) for f in files]
+    too_big = _too_big_read(uploads)  # real bytes; the declared size can be absent
+    if too_big:
+        return _error(too_big, status=413)
     try:
         data = load_files(uploads)
     except ValueError as exc:
@@ -804,6 +885,9 @@ async def inspect(
     if too_big:
         return _error(too_big, status=413)
     uploads = [(f.filename or "upload", await f.read()) for f in files]
+    too_big = _too_big_read(uploads)  # real bytes; the declared size can be absent
+    if too_big:
+        return _error(too_big, status=413)
     try:
         data = load_files(uploads)
     except ValueError as exc:
@@ -1076,6 +1160,7 @@ async def parse(
     context = (glossary + "\n\n" + history).strip() if glossary else history
 
     # Translate via the Brain (falling back to the deterministic parser if it's down).
+    used_fallback = False
     try:
         plan = llm.parse_instruction(instruction, structure, context)
     except Exception as exc:
@@ -1083,6 +1168,7 @@ async def parse(
         key_missing = isinstance(exc, RuntimeError) and not unavailable
         if not (unavailable or key_missing):
             traceback.print_exc()
+        used_fallback = True
         plan = fallback.parse(instruction, structure, personalization.effective_definitions(team_id, org_id or None))
         if plan is None:
             if unavailable:
@@ -1099,6 +1185,18 @@ async def parse(
     clarification = plan.get("clarification")
     reply = plan.get("reply")
     operations = plan.get("operations") or []
+    # Track 4 item 5: record what the Brain proposed BEFORE anything acts on it — a plan
+    # that was never run is exactly what you need when the complaint is "it misunderstood
+    # me". `source` distinguishes the real Brain from the offline fallback parser.
+    oplog.record_plan(
+        oplog.new_run_id(),
+        session_id=session_id,
+        instruction=instruction,
+        operations=operations,
+        source="fallback" if used_fallback else "brain",
+        status=("plan" if operations else ("clarify" if clarification else "message")),
+        confidence=plan.get("confidence") if isinstance(plan.get("confidence"), int) else None,
+    )
     if not operations:
         if reply:
             return JSONResponse({"status": "message", "message": reply})
@@ -1184,13 +1282,49 @@ async def parse(
 
 
 def _run_operations(
-    session_id: str, base: dict, operations: list[dict], ai_title, started_at: float
+    session_id: str, base: dict, operations: list[dict], ai_title, started_at: float,
+    progress=None, run_id: str | None = None, retry: bool = False,
 ) -> JSONResponse:
+    """Synchronous wrapper: run the plan and render the HTTP response.
+
+    The body is produced by _run_operations_body so the async job path (Track 4 item 1)
+    can reuse the IDENTICAL execution — see that function's docstring."""
+    status, body = _run_operations_body(
+        session_id, base, operations, ai_title, started_at, progress, run_id, retry
+    )
+    return JSONResponse(body, status_code=status)
+
+
+def _run_operations_body(
+    session_id: str, base: dict, operations: list[dict], ai_title, started_at: float,
+    progress=None, run_id: str | None = None, retry: bool = False,
+) -> tuple[int, dict]:
     """Run an operation plan on a base state, push the new state, serialize, and build
-    the OK response. Shared shape with /process (deltas, formulas, preview, partial
+    the OK response BODY. Shared shape with /process (deltas, formulas, preview, partial
     warnings, streamed download). Returns a friendly 422 on an expected step failure or
-    500 on an unexpected bug. Trusted code runs the plan — the model never executes."""
+    500 on an unexpected bug. Trusted code runs the plan — the model never executes.
+
+    Returns (http_status, body) rather than a Response so that /execute and /execute/async
+    run the same code. The async path needs the plain dict: it stores the body and replays
+    it later, and building a Response on a worker thread just to unpack it again would
+    mean serializing a multi-MB base64 workbook twice.
+
+    `progress` is an optional jobs.Progress. Every call on it reflects something that
+    actually happened — a step the executor reached, or the run entering the serialize
+    phase — so nothing here can report movement that didn't occur.
+    """
     tables, primary, exts = base["tables"], base["primary"], base["exts"]
+
+    # Track 4 item 5: one run_id ties this execution to its plan and its outcome, so a
+    # later "it dropped my rows" can be answered from the recorded row delta + plan shape
+    # instead of guesswork. Overlapping requests stay distinguishable. The async path
+    # passes its job id in, because a job and its run are the same event under one name.
+    run_id = run_id or oplog.new_run_id()
+    rows_before = sum(int(len(d)) for d in tables.values())
+    oplog.record_plan(
+        run_id, session_id=session_id, operations=operations, source="user",
+        status="executing", retry=retry,
+    )
 
     partial_warning = None
     completed_steps = len(operations)  # all steps ran unless a later one fails
@@ -1206,9 +1340,20 @@ def _run_operations(
     if _cached is not None:
         result, result_name, notes, render_ops = _cached
         cache_hit = True
+        if progress is not None:
+            # No steps will run, so report the plan complete AND latch the fact that this
+            # was memoized — a client should be able to say "reused an identical earlier
+            # result" rather than implying the work was redone.
+            progress.phase(jobs.PHASE_CACHED)
+            progress.steps_done()
     else:
         try:
-            result, result_name, notes, render_ops = execute_multi(tables, primary, operations)
+            result, result_name, notes, render_ops = execute_multi(
+                tables, primary, operations,
+                on_step=(progress.step if progress is not None else None),
+            )
+            if progress is not None:
+                progress.steps_done()
         except MultiStepError as exc:
             # A later step failed: keep the file reflecting the completed steps (PRD MS-b).
             result, result_name = exc.partial_result, exc.partial_name
@@ -1221,10 +1366,41 @@ def _run_operations(
                 f"Your file reflects the {done} step{'s' if done != 1 else ''} that "
                 "completed before it — fix that step and try again."
             )
+        except OperationCancelled as exc:
+            # Track 4 item 6. Stopped between steps, so NOTHING is pushed to the session:
+            # completed steps existed only in memory and are discarded, leaving the user's
+            # file exactly as it was. Discarding beats half-applying — a partially applied
+            # plan the user didn't ask for and can't see is worse than no change at all.
+            oplog.record_outcome(
+                run_id, status="timeout", rows_before=rows_before,
+                duration_ms=int((time.time() - started_at) * 1000),
+                completed_steps=exc.completed_steps, error=str(exc),
+            )
+            done, total = exc.completed_steps, exc.total_steps or len(operations)
+            return 504, {
+                "status": "timeout",
+                "error": (
+                    f"This took longer than the time budget and was stopped after "
+                    f"{done} of {total} step{'s' if total != 1 else ''}. Your file is "
+                    "unchanged — try a smaller file, or split the request into steps."
+                ),
+                "completed_steps": done,
+                "total_steps": total,
+                "run_id": run_id,
+            }
         except OperationError as exc:
-            return _error(str(exc), status=422)
-        except Exception:
-            return _error(_INTERNAL_ERROR, status=500)
+            oplog.record_outcome(
+                run_id, status="error", rows_before=rows_before,
+                duration_ms=int((time.time() - started_at) * 1000), error=str(exc),
+            )
+            return 422, _error_body(str(exc))
+        except Exception as exc:
+            oplog.record_outcome(
+                run_id, status="error", rows_before=rows_before,
+                duration_ms=int((time.time() - started_at) * 1000),
+                error=f"unexpected {type(exc).__name__}: {exc}",
+            )
+            return 500, _error_body(_INTERNAL_ERROR)
         else:
             scale.RESULT_CACHE.put(_sig, (result, result_name, notes, render_ops))
 
@@ -1253,6 +1429,11 @@ def _run_operations(
             "but big files can take a little longer."
         ] + notes
 
+    # Writing the workbook is a real phase, not padding — serializing 120k rows to .xlsx
+    # is a large share of the wall clock, and a tracker that froze on "last step done"
+    # while this ran would look hung.
+    if progress is not None:
+        progress.phase(jobs.PHASE_SAVING)
     try:
         if isinstance(result, dict):
             out_bytes, out_name, media_type = _serialize_workbook(result, result_name, primary=result_name, render_ops=render_ops)
@@ -1263,22 +1444,42 @@ def _run_operations(
                 notes = notes + [upgrade_note]
             out_bytes, out_name, media_type = _serialize(result, result_name, out_ext, render_ops)
             row_count = int(len(result))
-    except Exception:
-        return _error(_INTERNAL_ERROR, status=500)
+    except Exception as exc:
+        oplog.record_outcome(
+            run_id, status="error", rows_before=rows_before,
+            duration_ms=int((time.time() - started_at) * 1000),
+            error=f"serialize failed: {type(exc).__name__}: {exc}",
+        )
+        return 500, _error_body(_INTERNAL_ERROR)
+
+    oplog.record_outcome(
+        run_id,
+        status="partial" if failed_step else "ok",
+        rows_before=rows_before,
+        rows_after=row_count,
+        duration_ms=int((time.time() - started_at) * 1000),
+        cached=cache_hit,
+        completed_steps=completed_steps,
+        failed_step=failed_step,
+    )
 
     download_id = _store_result(out_bytes, out_name, media_type)
     inline_b64 = (
         base64.b64encode(out_bytes).decode("ascii")
         if len(out_bytes) <= _INLINE_MAX_BYTES else None
     )
-    return JSONResponse(
-        {
+    return 200, {
             "status": "ok",
             "session_id": session_id,
+            "run_id": run_id,  # Track 4 item 5: quote this in a bug report to find the log
             "cached": cache_hit,  # Phase 5.8: this result came from the cache (recompute skipped)
             "explanation": " ".join(notes) if notes else "No changes were needed.",
             "notes": notes,
             "formulas": _describe_formulas(render_ops),
+            # Track 4 item 3: for EVERY step, whether the file got a live Excel formula or
+            # a computed value — and so whether it recalculates when the user edits the
+            # data. Derived from the directives the run really emitted, not from intent.
+            "computation": compute_mode.describe(operations, render_ops),
             "code": _explain_code(operations),  # Phase 3.3 "Show Code" — mirrors the executed plan
             # Confidence on forecasts/anomalies (Phase 3.10).
             "analysis": [d for d in render_ops if d.get("type") == "analysis"],
@@ -1302,8 +1503,7 @@ def _run_operations(
             "elapsed_ms": int((time.time() - started_at) * 1000),
             "download_id": download_id,
             "file_base64": inline_b64,
-        }
-    )
+    }
 
 
 @app.post("/execute")
@@ -1322,10 +1522,52 @@ async def execute(
     With guard=true (the UI sets this), a destructive plan returns status
     'confirm_required' with a concrete impact instead of running, until confirm=true."""
     started_at = time.time()
+    err, prep = _prepare_execution(session_id, plan, rewind, guard, confirm)
+    if err is not None:
+        return err
+    base, operations, ai_title = prep["base"], prep["operations"], prep["ai_title"]
 
+    resp = _run_operations(
+        session_id, base, operations, ai_title, started_at, retry=prep["retry"]
+    )
+
+    # Record the run for the weekly digest — ONLY for a signed-in user and ONLY on success
+    # (a 200; _run_operations returns 4xx/5xx on failure). Best-effort: digest.record_run
+    # swallows its own errors, and _extract_row_count guards the body parse, so nothing here
+    # can turn a successful task into an error for the user.
+    if user is not None and resp.status_code == 200:
+        summary = ai_title or ", ".join(dict.fromkeys(
+            op.get("action") for op in operations if op.get("action"))) or None
+        digest.record_run(user.id, summary, _extract_row_count(resp))
+
+    return resp
+
+
+def _prepare_execution(
+    session_id: str, plan: str, rewind: int, guard: str, confirm: str
+) -> tuple[JSONResponse | None, dict | None]:
+    """Everything /execute does BEFORE running: resolve the session, rewind history,
+    parse and shape-check the plan, and apply the destructive-action guard.
+
+    Shared verbatim by /execute and /execute/async (Track 4 item 1) so the two cannot
+    drift — an async path that validated differently would be a second, subtly different
+    API. Returns (response_to_return_now, None) or (None, prepared).
+    """
     entry = _SESSIONS.get(session_id) if session_id else None
     if not entry or not entry.get("states"):
-        return _error("Please upload a spreadsheet to start.", status=400)
+        return _error("Please upload a spreadsheet to start.", status=400), None
+
+    # One live job per session. Two plans executing against one session would race on its
+    # undo/redo history and the second one's "previous state" would be undefined, so this
+    # is a correctness guard, not a courtesy — and it applies to the SYNCHRONOUS path too.
+    busy = jobs.active_for_session(session_id)
+    if busy:
+        return _error(
+            "That spreadsheet already has a change running. Wait for it to finish "
+            "before starting another.",
+            status=409,
+        ), None
+
     states = entry["states"]
     if 0 <= rewind < len(states):
         del states[rewind + 1:]  # Retry/Edit: branch from an earlier step
@@ -1334,10 +1576,29 @@ async def execute(
     try:
         parsed = json.loads(plan)
     except Exception:
-        return _error("That plan couldn't be read — please try running again.", status=400)
+        return _error("That plan couldn't be read — please try running again.", status=400), None
+    # NORMALIZE the container before reading anything out of it. A plan may arrive either
+    # wrapped ({"operations": [...]}, what the UI sends) or as a bare list of steps, which
+    # is the natural way to hand-write or script one — and which /marketplace, /workflow
+    # and /sheets already accept. /execute was the odd one out: a list hit `parsed.get`
+    # and raised AttributeError -> 500 "something went wrong on our side", blaming the
+    # server for input the caller can fix. Same class as the malformed-STEP guard below,
+    # one level up — that shape-checks the steps but assumed the container was a dict.
+    # Normalizing here (rather than at each call site) also covers the later
+    # parsed.get("title").
+    if isinstance(parsed, list):
+        parsed = {"operations": parsed}
+    elif not isinstance(parsed, dict):
+        return _error(
+            "That plan isn't in a format I recognise — it should be a list of steps, or "
+            'an object with an "operations" list.',
+            status=400,
+        ), None
     operations = parsed.get("operations") or []
+    if not isinstance(operations, list):
+        return _error('That plan\'s "operations" should be a list of steps.', status=400), None
     if not operations:
-        return _error("There's nothing to run.", status=400)
+        return _error("There's nothing to run.", status=400), None
     # Shape-check every step before executing. /process routes Brain output through
     # _sane_plan; /execute takes a plan from the UI (which the user can hand-edit), so
     # it needs the same guard. Without it a null/!dict step reached the executor and
@@ -1352,11 +1613,13 @@ async def execute(
             f"Step {bad} of that plan isn't a valid operation — each step needs an "
             "\"action\". Edit the plan and try again.",
             status=422,
-        )
+        ), None
     ai_title = (parsed.get("title") or "").strip() or None
 
     # Guardrails (3.10): warn before destructive actions, with concrete impact. Opt-in via
     # `guard` so non-UI callers keep the immediate behaviour; bypassed once `confirm`ed.
+    # This runs BEFORE any job is created, so a plan awaiting confirmation never becomes a
+    # job the user then has to wait on.
     want_guard = str(guard).strip().lower() in ("1", "true", "yes")
     confirmed = str(confirm).strip().lower() in ("1", "true", "yes")
     if want_guard and not confirmed:
@@ -1366,20 +1629,144 @@ async def execute(
                 "status": "confirm_required",
                 "warnings": assessment["warnings"],
                 "summary": assessment["summary"],
-            })
+            }), None
 
-    resp = _run_operations(session_id, base, operations, ai_title, started_at)
+    # rewind >= 0 means the caller branched from an earlier step — the UI's Retry/Edit.
+    # It is the only signal that someone was dissatisfied enough to go round again.
+    return None, {
+        "base": base, "operations": operations, "ai_title": ai_title, "entry": entry,
+        "retry": rewind is not None and rewind >= 0,
+    }
 
-    # Record the run for the weekly digest — ONLY for a signed-in user and ONLY on success
-    # (a 200; _run_operations returns 4xx/5xx on failure). Best-effort: digest.record_run
-    # swallows its own errors, and _extract_row_count guards the body parse, so nothing here
-    # can turn a successful task into an error for the user.
-    if user is not None and resp.status_code == 200:
-        summary = ai_title or ", ".join(dict.fromkeys(
-            op.get("action") for op in operations if op.get("action"))) or None
-        digest.record_run(user.id, summary, _extract_row_count(resp))
 
-    return resp
+@app.post("/execute/async")
+async def execute_async(
+    session_id: str = Form(...),
+    plan: str = Form(...),
+    rewind: int = Form(-1),
+    guard: str = Form("false"),
+    confirm: str = Form("false"),
+    timeout_seconds: str = Form(""),
+    user: "auth.User | None" = Depends(auth.current_user_optional),
+) -> JSONResponse:
+    """Same as /execute, but returns immediately with a job to watch (Track 4 item 1).
+
+    WHY THIS EXISTS: /execute does tens of seconds of pandas + openpyxl work on a 100k+
+    row workbook, inside an `async def` — i.e. ON the event loop — so one big file stalls
+    every other request in the process. Here the work moves to a worker thread.
+
+    POLLING, NOT SSE. This is a single-process app with in-memory state, and a poll is
+    one cheap dict lookup (`snapshot` never touches the result body). SSE would hold a
+    connection open per run and still need the same store behind it, buying nothing but a
+    second failure mode — a dropped stream leaves the client with no way to re-read state,
+    whereas a missed poll is simply retried. Revisit if this ever becomes multi-process.
+
+    Validation, the destructive-action guard and the execution itself are the SAME code
+    /execute uses — see _prepare_execution and _run_operations_body.
+    """
+    err, prep = _prepare_execution(session_id, plan, rewind, guard, confirm)
+    if err is not None:
+        return err
+    base, operations, ai_title = prep["base"], prep["operations"], prep["ai_title"]
+
+    # The job id IS the oplog run id: one identifier for one event (see jobs.py).
+    job_id = oplog.new_run_id()
+    started_at = time.time()
+
+    def work(progress):
+        status, body = _run_operations_body(
+            session_id, base, operations, ai_title, started_at, progress,
+            run_id=job_id, retry=prep["retry"],
+        )
+        # Digest parity with the synchronous path: signed-in users, successes only.
+        if user is not None and status == 200:
+            summary = ai_title or ", ".join(dict.fromkeys(
+                op.get("action") for op in operations if op.get("action"))) or None
+            digest.record_run(user.id, summary, body.get("row_count"))
+        return status, body
+
+    # Track 4 item 6: a caller may ask for a SHORTER budget than the server default (e.g.
+    # an interactive UI that would rather fail fast), but never a longer one — otherwise a
+    # client could pin a worker indefinitely.
+    budget = config.JOB_TIMEOUT_SECONDS
+    try:
+        want = float(timeout_seconds)
+        if want > 0:
+            budget = min(budget, want) if budget > 0 else want
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        job = jobs.submit(job_id, session_id, operations, work, timeout_seconds=budget)
+    except jobs.JobError as exc:
+        return _error(str(exc), status=exc.status)
+
+    return JSONResponse(
+        {
+            "status": "accepted",
+            "job_id": job["id"],
+            "run_id": job["id"],
+            "session_id": session_id,
+            "total_steps": job["total_steps"],
+            "timeout_seconds": job["timeout_seconds"],
+            "poll": f"/jobs/{job['id']}",
+            "result": f"/jobs/{job['id']}/result",
+        },
+        status_code=202,
+    )
+
+
+@app.get("/jobs/{job_id}")
+def job_status(job_id: str) -> JSONResponse:
+    """Where a job actually is. Cheap enough to poll once a second: the snapshot never
+    includes the result body."""
+    snap = jobs.snapshot(job_id)
+    if snap is None:
+        return _error("I don't know that job — it may have finished long ago.", status=404)
+    return JSONResponse({"status": "ok", "job": snap})
+
+
+@app.get("/jobs/{job_id}/result")
+def job_result(job_id: str) -> JSONResponse:
+    """Collect a finished job's result — byte-for-byte what /execute would have returned.
+
+    409 while it is still running: saying "not yet" is honest, whereas returning an empty
+    success would be a lie the client cannot detect.
+    """
+    snap = jobs.snapshot(job_id)
+    if snap is None:
+        return _error("I don't know that job — it may have finished long ago.", status=404)
+    if not snap["done"]:
+        return JSONResponse(
+            {
+                "status": "pending",
+                "error": "That change is still running.",
+                "job": snap,
+            },
+            status_code=409,
+        )
+    got = jobs.result(job_id)
+    if got is None:
+        # Finished, but the body was dropped by the memory budget. The receipt still says
+        # where the file is, so this is a redirect to the download rather than a loss.
+        return JSONResponse(
+            {
+                "status": "expired",
+                "error": "That result is no longer held in memory, but the file is still "
+                         "available to download.",
+                "job": snap,
+                "receipt": snap["receipt"],
+            },
+            status_code=410,
+        )
+    http_status, body = got
+    return JSONResponse(body, status_code=http_status)
+
+
+@app.get("/jobs")
+def job_list(limit: int = 20) -> JSONResponse:
+    """Recent jobs, most-recent-first — for debugging a live server."""
+    return JSONResponse({"status": "ok", "jobs": jobs.recent(limit)})
 
 
 def _extract_row_count(resp: JSONResponse) -> int | None:
@@ -1437,6 +1824,9 @@ async def process(
         if too_big:
             return _error(too_big, status=413)
         uploads = [(f.filename or "upload", await f.read()) for f in files]
+        too_big = _too_big_read(uploads)  # real bytes; the declared size can be absent
+        if too_big:
+            return _error(too_big, status=413)
         try:
             data = load_files(uploads)
         except ValueError as exc:
@@ -1632,6 +2022,10 @@ async def process(
             "explanation": " ".join(notes) if notes else "No changes were needed.",
             "notes": notes,
             "formulas": _describe_formulas(render_ops),
+            # Track 4 item 3: for EVERY step, whether the file got a live Excel formula or
+            # a computed value — and so whether it recalculates when the user edits the
+            # data. Derived from the directives the run really emitted, not from intent.
+            "computation": compute_mode.describe(operations, render_ops),
             "code": _explain_code(operations),  # Phase 3.3 "Show Code" — mirrors the executed plan
             # Spoken feedback (Phase 3.6): a TTS-ready line shaped to the user's chosen
             # verbosity (silent/step/summary). null in silent mode. Purely a view over
@@ -2947,17 +3341,36 @@ _INTERNAL_ERROR = (
 )
 
 
+def _size_message(total: int) -> str:
+    return (
+        f"That upload is too large (~{total / 1024 / 1024:.0f} MB). "
+        f"Please keep files under {config.MAX_UPLOAD_MB} MB."
+    )
+
+
 def _too_big(files) -> str | None:
-    """Friendly message if the combined upload exceeds the size limit, else None.
-    Guards against a single huge upload exhausting server memory."""
+    """Friendly message if the DECLARED combined upload size exceeds the limit.
+
+    This is the cheap pre-check: it rejects an oversized upload before we read it. It is
+    not sufficient on its own — UploadFile.size can be None when the parser hasn't
+    populated it, and `or 0` then scores the file as empty and lets it through. Pair it
+    with _too_big_read() after the bytes are in hand (Track 5 item 5).
+    """
     limit = config.MAX_UPLOAD_MB * 1024 * 1024
     total = sum((getattr(f, "size", None) or 0) for f in files)
-    if total > limit:
-        return (
-            f"That upload is too large (~{total / 1024 / 1024:.0f} MB). "
-            f"Please keep files under {config.MAX_UPLOAD_MB} MB."
-        )
-    return None
+    return _size_message(total) if total > limit else None
+
+
+def _too_big_read(uploads) -> str | None:
+    """The same limit, measured against the bytes actually read.
+
+    Closes the fail-open path above: whatever the declared size said, this is the real
+    number. Cheap — the bytes are already in memory by this point — and it means an
+    upload with no declared size can no longer slip past the guard.
+    """
+    limit = config.MAX_UPLOAD_MB * 1024 * 1024
+    total = sum(len(b or b"") for _, b in uploads)
+    return _size_message(total) if total > limit else None
 
 
 # --------------------------------------------------------------------------- #
@@ -3636,6 +4049,9 @@ async def quality_check(
         if too_big:
             return _error(too_big, status=413)
         uploads = [(f.filename or "upload", await f.read()) for f in files]
+        too_big = _too_big_read(uploads)  # real bytes; the declared size can be absent
+        if too_big:
+            return _error(too_big, status=413)
         try:
             data = load_files(uploads)
         except ValueError as exc:
@@ -4859,5 +5275,11 @@ def _record_formulas(session_id: str, operations: list[dict], result) -> None:
             reg.pop(k, None)
 
 
+def _error_body(message: str) -> dict:
+    """The error BODY on its own. The async job path stores bodies rather than Responses,
+    so both paths must be able to build the same shape (see _run_operations_body)."""
+    return {"status": "error", "error": message}
+
+
 def _error(message: str, status: int) -> JSONResponse:
-    return JSONResponse({"status": "error", "error": message}, status_code=status)
+    return JSONResponse(_error_body(message), status_code=status)

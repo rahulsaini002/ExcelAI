@@ -34,10 +34,22 @@ PIVOT_STYLE = os.getenv("SUMIO_PIVOT_STYLE", "static").strip().lower()
 #                  secret for server callers (the Sheets add-on); for the browser app it's
 #                  a coarse gate (the SPA sends it via NEXT_PUBLIC_API_TOKEN).
 #   RATE_LIMIT   — max requests per IP per RATE_WINDOW seconds (0 = unlimited). Protects
-#                  the public AI endpoints from abuse / runaway cost.
+#                  the public AI endpoints from abuse / runaway cost. ON by default now
+#                  (Track 5 item 5): the machinery existed but shipped dormant, which is
+#                  the same as not having it. 300/min is generous for a person driving the
+#                  UI — including the job-status polling, which backs off — while still
+#                  capping a script. Heavy test suites that poll in a tight loop set
+#                  SUMIO_RATE_LIMIT=0 explicitly rather than the default being weakened
+#                  for everyone.
+#   TRUST_PROXY  — whether to believe X-Forwarded-For. OFF by default, because that header
+#                  is client-settable: trusting it blindly let a caller mint a fresh
+#                  rate-limit bucket per request. Turn it ON only when a proxy you control
+#                  (Render/Vercel/nginx) sits in front, and see _client_ip for why the
+#                  LAST hop is the one that gets used.
 API_TOKEN = os.getenv("SUMIO_API_TOKEN", "").strip()
-RATE_LIMIT = int(os.getenv("SUMIO_RATE_LIMIT", "0"))
+RATE_LIMIT = int(os.getenv("SUMIO_RATE_LIMIT", "300"))
 RATE_WINDOW = float(os.getenv("SUMIO_RATE_WINDOW", "60"))
+TRUST_PROXY = os.getenv("SUMIO_TRUST_PROXY", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 # Resource limits, so a single user can't exhaust server memory.
 #   MAX_UPLOAD_MB     — reject uploads whose combined size exceeds this. It's a clean
@@ -48,6 +60,30 @@ RATE_WINDOW = float(os.getenv("SUMIO_RATE_WINDOW", "60"))
 MAX_UPLOAD_MB = int(os.getenv("SUMIO_MAX_UPLOAD_MB", "250"))
 MAX_SESSIONS = int(os.getenv("SUMIO_MAX_SESSIONS", "200"))
 MAX_STATES = int(os.getenv("SUMIO_MAX_STATES", "30"))
+
+# Async execution jobs (Track 4 item 1).
+#   JOB_WORKERS         worker threads running plans off the event loop. Small on
+#                       purpose: the work is pandas/openpyxl (memory-hungry, and largely
+#                       GIL-bound outside numpy), so more threads mostly multiplies peak
+#                       memory rather than throughput. Raise only with real evidence.
+#   MAX_JOBS            cap on retained job RECORDS (tiny dicts). Running jobs are never
+#                       evicted; only finished ones are forgettable.
+#   MAX_JOB_RESULT_MB   byte budget for retained result BODIES, which are the big part (an
+#                       inline base64 workbook can be several MB). Past the budget the
+#                       oldest finished bodies are dropped but their receipt (download id,
+#                       filename, row count) is kept, so the file is still reachable.
+#   JOB_TIMEOUT_SECONDS time budget for one job, measured from ACCEPTANCE (queue time is
+#                       part of what the user waits). 0 disables it. Cancellation is
+#                       COOPERATIVE and lands at step boundaries — a worker thread running
+#                       pandas cannot be safely interrupted mid-operation. It is checked
+#                       before EVERY step including the first, so a spent budget stops a
+#                       run before it does any work; but a step already BEGUN always runs
+#                       to completion, so a single very long step can overrun. 10 minutes
+#                       is well clear of a legitimate 120k-row multi-step run (~7s).
+JOB_WORKERS = int(os.getenv("SUMIO_JOB_WORKERS", "2"))
+MAX_JOBS = int(os.getenv("SUMIO_MAX_JOBS", "100"))
+MAX_JOB_RESULT_MB = int(os.getenv("SUMIO_MAX_JOB_RESULT_MB", "64"))
+JOB_TIMEOUT_SECONDS = float(os.getenv("SUMIO_JOB_TIMEOUT_SECONDS", "600"))
 
 # Generated result files are written here so downloads (and "continue on the result")
 # survive a backend restart. Kept under MAX_RESULTS_MB and deleted after RESULTS_TTL_HOURS.
