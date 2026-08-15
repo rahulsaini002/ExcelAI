@@ -873,12 +873,25 @@ async def compare_versions(
 async def inspect(
     files: list[UploadFile] = File(...),
     session_id: str = Form(""),
+    mode: str = Form("replace"),
 ) -> JSONResponse:
     """Read uploaded file(s) and return their structure (sheets, columns + types,
     row count, sample rows) so the UI can show a preview BEFORE any operation.
 
     If a `session_id` is given, the loaded data is ALSO remembered for that session
-    so the two-phase flow (/parse then /execute) can reuse it without re-uploading."""
+    so the two-phase flow (/parse then /execute) can reuse it without re-uploading.
+
+    `mode` decides what happens to work already done in that session:
+      "replace" (default)  start over — the new file becomes the session, history reset.
+      "add"                bring the new file ALONGSIDE the current data, keeping every
+                           step already applied. Uploading a price list to look values up
+                           from should not throw away an hour of work, which is what
+                           replace-only behaviour did.
+
+    "add" pushes a NEW STATE rather than rewriting the current one, so Undo removes the
+    added file and puts the session back exactly as it was — the same model every other
+    operation follows.
+    """
     if not files:
         return _error("Please upload a spreadsheet.", status=400)
     too_big = _too_big(files)
@@ -892,27 +905,77 @@ async def inspect(
         data = load_files(uploads)
     except ValueError as exc:
         return _error(str(exc), status=400)
+    except llm.ModelUnavailableError as exc:
+        # An image or scanned PDF needs OCR, which needs the model. When that is
+        # rate-limited or down, this is NOT our server failing — and reader.py passes the
+        # error up untouched precisely so the caller can say so. Without this branch it
+        # fell into the generic handler below and returned 500 "something went wrong on
+        # our side", blaming us for a queue the user only has to wait out. Every other
+        # model-calling endpoint already translated this to a 503; /inspect was the gap.
+        return _error(str(exc), status=503)
     except Exception:
         return _error(_INTERNAL_ERROR, status=500)
 
     # Remember the upload for the session so /parse + /execute can use it.
+    added_to_existing = False
     if session_id:
-        _remember_session(
-            session_id,
-            {
-                "tables": dict(data.tables),
-                "primary": data.primary,
-                "exts": dict(data.exts),
-                "notes": dict(data.notes),
-            },
-        )
+        entry = _SESSIONS.get(session_id)
+        wants_add = str(mode).strip().lower() == "add"
+        if wants_add and entry and entry.get("states"):
+            # Keep everything already done: start from the CURRENT state and add the new
+            # tables beside it. A name clash gets a numeric suffix rather than silently
+            # overwriting a table the user is working on.
+            base = entry["states"][-1]
+            tables_now = dict(base["tables"])
+            exts_now = dict(base.get("exts") or {})
+            notes_now = dict(base.get("notes") or {})
+            for name, df in data.tables.items():
+                unique = name
+                n = 2
+                while unique in tables_now:
+                    unique = f"{name} ({n})"
+                    n += 1
+                tables_now[unique] = df
+                exts_now[unique] = data.exts.get(name, "xlsx")
+                if data.notes.get(name):
+                    notes_now[unique] = data.notes[name]
+            _push_state(session_id, {
+                "tables": tables_now,
+                # The working table stays what it was: adding a reference sheet must not
+                # silently redirect the next instruction onto the new file.
+                "primary": base["primary"],
+                "exts": exts_now,
+                "notes": notes_now,
+                "label": f"Added {files[0].filename or 'file'}",
+            })
+            added_to_existing = True
+        else:
+            _remember_session(
+                session_id,
+                {
+                    "tables": dict(data.tables),
+                    "primary": data.primary,
+                    "exts": dict(data.exts),
+                    "notes": dict(data.notes),
+                },
+            )
+
+    # After an "add", report the WHOLE session (existing tables + the new ones) so the UI
+    # shows the user everything they can now work with, not just the file they dropped.
+    if added_to_existing:
+        latest = _SESSIONS[session_id]["states"][-1]
+        preview_tables = latest["tables"]
+        preview_notes = latest.get("notes") or {}
+    else:
+        preview_tables = data.tables
+        preview_notes = data.notes
 
     tables = []
-    for name, df in data.tables.items():
+    for name, df in preview_tables.items():
         s = summarize_structure(df, sample_rows=5)
         rc = s["row_count"]
         note_parts = []
-        ocr_note = data.notes.get(name, "")
+        ocr_note = preview_notes.get(name, "")
         if ocr_note:
             note_parts.append(ocr_note)
         if rc == 0:
@@ -928,7 +991,14 @@ async def inspect(
                 "note": " ".join(note_parts) if note_parts else None,
             }
         )
-    return JSONResponse({"status": "ok", "tables": tables})
+    return JSONResponse({
+        "status": "ok",
+        "tables": tables,
+        # True when this upload joined an existing session instead of replacing it, so
+        # the UI can say "added" rather than implying a fresh start.
+        "added": added_to_existing,
+        "added_tables": list(data.tables) if added_to_existing else [],
+    })
 
 
 def _shield_columns(shielded: list[str]) -> list[str]:
