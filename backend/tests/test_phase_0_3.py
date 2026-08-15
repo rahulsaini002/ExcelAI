@@ -65,6 +65,14 @@ XL = "application/octet-stream"
 CLEANUP_ACTIONS = {
     "trim", "remove_duplicates", "fill_missing", "drop_missing", "drop_invalid",
     "flag_missing", "find_replace", "format_cells",
+    # conditional_format = highlight cells matching a rule (e.g. shade the blanks). It
+    # changes no data and is reviewable in the preview, so by the rule stated above it
+    # belongs with flag_missing/format_cells — it is the visual sibling of both. Added
+    # 2026-08-13 after the multilingual few-shot work, when the Brain started reaching
+    # for it to highlight missing prices during a vague tidy-up. Widening the set here is
+    # NOT to make a test pass: the equivalent overreach it replaced (inventing
+    # add_formula_column columns) was fixed in the PROMPT, not excused here.
+    "conditional_format",
 }
 
 
