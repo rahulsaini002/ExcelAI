@@ -171,12 +171,27 @@ for fname, blob, mime in (
 ):
     r = client.post("/inspect", data={"session_id": "img"}, files=[("files", (fname, blob, mime))])
     body = r.json()
-    check(f"m. unreadable image ({fname}) -> clean 4xx, not a 500",
-          400 <= r.status_code < 500 and body.get("status") == "error",
+    # An image goes through OCR, which needs the model — so there are TWO honest outcomes
+    # and which one you get depends on whether the model is reachable right now:
+    #   4xx  OCR ran and the file really is unreadable -> name the formats we accept.
+    #   503  the model is rate-limited/down, so we CANNOT know whether the file was
+    #        readable. Saying "this file is bad" would be a guess; "the AI is busy, try
+    #        again" is the truth. (/inspect used to return 500 here, blaming our server
+    #        for a queue the user only has to wait out.)
+    # The invariant either way — and the point of this check — is never a 500.
+    unavailable = r.status_code == 503
+    check(f"m. unreadable image ({fname}) -> clean 4xx or an honest 503, never a 500",
+          (400 <= r.status_code < 500 or unavailable) and body.get("status") == "error",
           f"HTTP {r.status_code}: {str(body)[:140]}")
-    check(f"m. {fname} message tells the user what to upload instead",
-          any(w in str(body.get("error", "")).lower() for w in (".xlsx", ".csv", "spreadsheet")),
-          str(body.get("error"))[:140])
+    msg = str(body.get("error", "")).lower()
+    if unavailable:
+        check(f"m. {fname} 503 explains the AI is busy rather than blaming the file",
+              any(w in msg for w in ("rate-limit", "usage cap", "try again")),
+              str(body.get("error"))[:140])
+    else:
+        check(f"m. {fname} message tells the user what to upload instead",
+              any(w in msg for w in (".xlsx", ".csv", "spreadsheet")),
+              str(body.get("error"))[:140])
 
 print(f"\n{passed} passed, {failed} failed.")
 try:

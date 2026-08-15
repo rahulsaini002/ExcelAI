@@ -1401,7 +1401,19 @@ def _compute_formula_self_correcting(
                 repairs.append(f"#REF!: replaced missing {{{bad}}} with the closest column {{{good}}}")
             continue  # re-check with corrected references
 
-        advanced = bool(re.search(r"[A-Za-z_]\w*\s*\(", work_formula)) or any(c in work_formula for c in "<>=")
+        # "Advanced" = not plain arithmetic, so the numeric coercion below must not run.
+        # A function call, a comparison — or an `&`, which is Excel's TEXT CONCATENATION
+        # operator. Without `&` here, "{First} & {Last}" was read as plain arithmetic:
+        # the coercion step then found First/Last weren't numbers and refused the whole
+        # formula with "a formula column needs numeric columns" — which is not even true,
+        # since CONCAT({First}, {Last}) worked fine. It only worked because its bracket
+        # made it "advanced". The evaluator has handled `&` as concatenation all along
+        # (see the ast.BitAnd branch); it just never got the chance to run.
+        advanced = (
+            bool(re.search(r"[A-Za-z_]\w*\s*\(", work_formula))
+            or any(c in work_formula for c in "<>=")
+            or "&" in work_formula
+        )
 
         # ---- #VALUE! (plain arithmetic on text) : coerce numbers-from-text ----
         if not advanced:
@@ -1415,9 +1427,9 @@ def _compute_formula_self_correcting(
                     cols = [c for c, _ in unfixable]
                     raise OperationError(
                         f"#VALUE!: {', '.join(cols)} "
-                        f"{'aren’t' if len(cols) != 1 else 'isn’t'} numbers and can’t be "
-                        f"converted, so '{name}' can’t be calculated. "
-                        "A formula column needs numeric columns."
+                        f"{'aren’t' if len(cols) != 1 else 'isn’t'} numbers, so '{name}' "
+                        "can’t be calculated with maths. If you meant to join the text "
+                        "together, use & — e.g. {A} & \" \" & {B}."
                     )
                 work_df = work_df.copy()
                 for c, num in fixable:
@@ -1484,7 +1496,18 @@ def _compute_formula_self_correcting(
             if divzero_mask is not None:
                 nonfinite = nonfinite & ~divzero_mask
             refs_present = [c for c in row_refs if c in work_df.columns]
-            if refs_present and nonfinite.any() and np.isfinite(rn).any():
+            # Only a genuinely NUMERIC result can contain an invalid number. The old
+            # guard was "did any row coerce to a finite number?", which a TEXT formula
+            # can satisfy by accident: joining a blank with "2" yields the string "2",
+            # which coerces fine, and every other row ("x1", "z") then looked like an
+            # invalid number and was BLANKED — real text silently destroyed, and
+            # reported to the user as "auto-corrected an invalid number". That hit
+            # CONCAT and TEXTJOIN as well as &. Checking the result's dtype is the
+            # honest test: arithmetic produces a numeric Series, text does not.
+            if (
+                pd.api.types.is_numeric_dtype(result)
+                and refs_present and nonfinite.any() and np.isfinite(rn).any()
+            ):
                 present = np.logical_and.reduce(
                     [~_blank_mask(work_df[c]).to_numpy() for c in refs_present]
                 )

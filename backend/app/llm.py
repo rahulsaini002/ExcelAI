@@ -855,6 +855,75 @@ shows grouping like 12,34,567 — the format is "indian_currency", NEVER plain "
    "3-month moving average of Revenue" -> moving_average, columns ["Revenue"], count 3 ·
    "compare Qty for North vs South" -> t_test, value_column "Qty", group_by ["Region"].
 
+WORKED EXAMPLES ACROSS LANGUAGES. Every example above is written in English, which is \
+not how many of these users type. The same operations, asked for in Hindi (Devanagari), \
+Urdu, and romanised Hinglish — map each to the SAME action you would for the English \
+version. Column and sheet names usually stay in English even when the sentence does not; \
+use them exactly as they appear in the structure.
+
+  sort
+    HI  "बिक्री को सबसे ज़्यादा से सबसे कम क्रम में लगाओ" -> sort, orders ["desc"]
+    UR  "سیلز کو زیادہ سے کم ترتیب دیں" -> sort, orders ["desc"]
+    HG  "sales ko zyada se kam arrange kar do" -> sort, orders ["desc"]
+  filter
+    HI  "सिर्फ़ वे पंक्तियाँ रखो जहाँ Status 'Paid' है" -> filter, Status equals "Paid"
+    UR  "صرف وہ قطاریں رکھیں جہاں Status 'Paid' ہو" -> filter, Status equals "Paid"
+    HG  "sirf woh rows rakho jahan Status 'Paid' hai" -> filter, Status equals "Paid"
+  remove_duplicates
+    HI  "एक ही ग्राहक दो बार आया है, उसे हटा दो" -> remove_duplicates
+    UR  "ایک ہی کسٹمر دو بار آیا ہے، اسے ہٹا دیں" -> remove_duplicates
+    HG  "ek hi customer do baar aaya hai, use hata do" -> remove_duplicates
+  aggregate
+    HI  "हर शहर का कुल Revenue निकालो" -> aggregate, sum of Revenue grouped by City
+    UR  "ہر شہر کا کل Revenue نکالیں" -> aggregate, sum of Revenue grouped by City
+    HG  "har city ka total Revenue nikalo" -> aggregate, sum of Revenue grouped by City
+  add_formula_column
+    HI  "एक नया कॉलम बनाओ जिसमें Qty गुणा Price हो" -> add_formula_column "{Qty} * {Price}"
+    UR  "ایک نیا کالم بنائیں جس میں Qty ضرب Price ہو" -> add_formula_column "{Qty} * {Price}"
+    HG  "naya column banao jisme Qty into Price ho" -> add_formula_column "{Qty} * {Price}"
+  lookup
+    HI  "Products शीट से हर आइटम का Rate ले आओ" -> lookup Rate from Products
+    UR  "Products شیٹ سے ہر آئٹم کا Rate لے آئیں" -> lookup Rate from Products
+    HG  "Products sheet se har item ka Rate le aao" -> lookup Rate from Products
+  fill_missing
+    HI  "खाली सेल में 0 भर दो" -> fill_missing, fill_value 0
+    UR  "خالی خانوں میں 0 بھر دیں" -> fill_missing, fill_value 0
+    HG  "khali cells me 0 bhar do" -> fill_missing, fill_value 0
+  drop_missing
+    HI  "जिन पंक्तियों में Email खाली है उन्हें हटा दो" -> drop_missing on Email
+    UR  "جن قطاروں میں Email خالی ہے انہیں ہٹا دیں" -> drop_missing on Email
+    HG  "jin rows me Email khali hai unhe hata do" -> drop_missing on Email
+  find_replace
+    HI  "'Bombay' को 'Mumbai' से बदल दो" -> find_replace, find "Bombay", replace "Mumbai"
+    UR  "'Bombay' کو 'Mumbai' سے بدل دیں" -> find_replace, find "Bombay", replace "Mumbai"
+    HG  "'Bombay' ko 'Mumbai' se badal do" -> find_replace, find "Bombay", replace "Mumbai"
+  rename_column
+    HI  "'Amt' कॉलम का नाम बदलकर 'Amount' कर दो" -> rename_column Amt -> Amount
+    UR  "'Amt' کالم کا نام 'Amount' کر دیں" -> rename_column Amt -> Amount
+    HG  "'Amt' column ka naam 'Amount' kar do" -> rename_column Amt -> Amount
+  merge
+    HI  "दोनों फ़ाइलों को आपस में जोड़ दो" -> merge the two tables
+    UR  "دونوں فائلوں کو آپس میں ملا دیں" -> merge the two tables
+    HG  "dono files ko aapas me jod do" -> merge the two tables
+  chart
+    HI  "महीने के हिसाब से Revenue का लाइन चार्ट बनाओ" -> chart, line, x Month, y Revenue
+    UR  "مہینے کے حساب سے Revenue کا لائن چارٹ بنائیں" -> chart, line, x Month, y Revenue
+    HG  "month ke hisab se Revenue ka line chart banao" -> chart, line, x Month, y Revenue
+  forecast
+    HI  "आने वाले महीनों का Revenue बताओ" -> forecast on Revenue
+    UR  "آنے والے مہینوں کا Revenue بتائیں" -> forecast on Revenue
+    HG  "aane wale mahino ka Revenue predict karo" -> forecast on Revenue
+  multi-step (one sentence, several operations, IN ORDER)
+    HI  "पहले डुप्लिकेट हटाओ फिर Amount के हिसाब से लगाओ" -> [remove_duplicates, sort Amount]
+    UR  "پہلے ڈپلیکیٹ ہٹائیں پھر Amount کے حساب سے ترتیب دیں" -> [remove_duplicates, sort Amount]
+    HG  "pehle duplicate hatao phir Amount ke hisab se lagao" -> [remove_duplicates, sort Amount]
+
+These are ILLUSTRATIONS, not a vocabulary list — the same request can be phrased a \
+hundred other ways in each language, and operations not shown here are asked for in these \
+languages too. Read for MEANING and map it to the right action, exactly as you would in \
+English. The TIE, UNSUPPORTED and NEVER-SUBSTITUTE rules below apply identically \
+whichever script the user writes in.
+
 Rules:
 - Use the EXACT column and table names given in the structure. Match the user's intent \
 to real columns/tables even if they describe them loosely.
@@ -913,6 +982,14 @@ Revenue or Cost?").
 blanks with a STATISTIC (average/mean/median/mode/interpolation/regression), do NOT do \
 it — put a friendly decline in "reply": "Filling blanks with an average isn't supported \
 yet — try a fixed value like 0 or 'Unknown'." and leave operations empty.
+- VAGUE TIDY-UP ("clean it up", "tidy this", "sort this data out", and the same in any \
+language): the user has NOT said what is wrong, so make only safe, IN-PLACE repairs — \
+trim stray spaces, remove duplicate rows, fill or flag blanks, an obvious find/replace, \
+tidy number/date formatting. Do NOT ADD COLUMNS and do not restructure the sheet. \
+Creating a "Region (clean)" column with add_formula_column to standardise capitalisation \
+changes the SHAPE of someone's file to fix a problem they never described, and they have \
+to undo it. If you believe a derived column is what they want, ASK for confirmation \
+instead of adding one.
 - When your clarification asks the user to CHOOSE a column (e.g. which column to sort \
 by), ALWAYS list the available column names from the structure in the question, so the \
 user can pick. Example: "Which column should I sort by? Available: Name, Roll No., product".
@@ -988,7 +1065,11 @@ then aggregate for a focused summary." Omit for single-operation plans.
 #                 carve-out into the prefer-to-act bullet, added the mandatory
 #                 pre-flight tie check + "language does not change the rules"
 #   2026-08-12.2  Track 3 item 1: documented the "relationships" context block
-PROMPT_VERSION = "2026-08-12.2"
+#   2026-08-13.1  Track 3 item 2: worked examples in Hindi/Urdu/Hinglish for the core
+#                 operations. Every example had been English-only, which is the same
+#                 shape of gap that let the Stage 0.3 tie/unsupported rules pass in
+#                 English and fail in Hindi.
+PROMPT_VERSION = "2026-08-13.1"
 
 
 def prompt_fingerprint() -> str:
