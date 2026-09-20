@@ -19,14 +19,24 @@ import json
 import time
 from pathlib import Path
 
-_MEMORY: dict[str, dict] = {}
+from . import store
+
+# REGISTERED WITH `store` so team memory lives in the DATABASE, not just a JSON file.
+# The file alone was never durable in production: this host has no persistent disk, so a
+# restart (which happens whenever it sleeps) wiped every custom term a team had taught it.
+#
+# ⚠️ These dicts are mutated IN PLACE everywhere below — never rebound — because `store`
+# holds a reference to this exact object. Reassigning (`_MEMORY = {...}`) would silently
+# detach it from the registry and stop persisting, which is exactly the kind of quiet
+# failure this change exists to remove.
+_MEMORY: dict[str, dict] = store.register("team_memory", {})
 
 # Shared / org-wide AI memory (Phase 5.2): a glossary keyed by an ORG scope that MANY teams
 # inherit, so terminology ("our ARR", "Runway") is consistent across the whole organization
 # — not just within one team's private memory. A team's own definition of a term OVERRIDES
 # the shared one (local wins), so teams can still specialize. Kept in its own store + file so
 # it never disturbs the existing per-team memory.json format.
-_SHARED: dict[str, dict] = {}
+_SHARED: dict[str, dict] = store.register("shared_memory", {})
 
 # Persisted so learning survives restarts. Tests set _PERSIST = False to stay off disk.
 _MEMORY_PATH = Path(__file__).resolve().parent.parent / "data" / "memory.json"
@@ -38,40 +48,57 @@ def _now() -> float:
     return time.time()
 
 
-def _load() -> None:
-    global _MEMORY
+def _read_json(path: Path) -> dict:
     try:
-        _MEMORY = json.loads(_MEMORY_PATH.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
     except Exception:
-        _MEMORY = {}
+        return {}
+
+
+def _restore(target: dict, namespace: str, path: Path) -> None:
+    """Fill `target` IN PLACE from the database, falling back to the JSON file.
+
+    Database first because it's the only durable copy in production. The file is still
+    read when the database has nothing, which covers two real cases: local development
+    with no DATABASE_URL, and a deployment that already had a memory.json — its contents
+    migrate into the database on the first save rather than being silently discarded.
+    """
+    data = store.load_dict(namespace) or _read_json(path)
+    target.clear()
+    target.update(data)
+
+
+def _load() -> None:
+    _restore(_MEMORY, "team_memory", _MEMORY_PATH)
 
 
 def _load_shared() -> None:
-    global _SHARED
+    _restore(_SHARED, "shared_memory", _SHARED_PATH)
+
+
+def _write(target: dict, namespace: str, path: Path) -> None:
+    if not _PERSIST:
+        return
+    # The database is the durable copy (no-op when persistence is off, e.g. local dev).
     try:
-        _SHARED = json.loads(_SHARED_PATH.read_text(encoding="utf-8"))
+        store.save(namespace)
     except Exception:
-        _SHARED = {}
+        pass  # best-effort; never fail a request over persistence
+    # The file is still written so local development keeps working without a database.
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(target, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def _persist() -> None:
-    if not _PERSIST:
-        return
-    try:
-        _MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _MEMORY_PATH.write_text(json.dumps(_MEMORY, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        pass  # persistence is best-effort; never fail a request over it
+    _write(_MEMORY, "team_memory", _MEMORY_PATH)
 
 
 def _persist_shared() -> None:
-    if not _PERSIST:
-        return
-    try:
-        _SHARED_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _SHARED_PATH.write_text(json.dumps(_SHARED, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        pass
+    _write(_SHARED, "shared_memory", _SHARED_PATH)
 
 
 def _team(team_id: str) -> dict:
