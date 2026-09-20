@@ -170,3 +170,66 @@ class KVStore(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now
     )
+
+
+class CloudSession(Base):
+    """A user's saved workspace session — the SOURCE FILE plus enough metadata to show it
+    in a session list. Account-scoped, so it follows the person rather than the browser.
+
+    WHY THIS EXISTS: `_SESSIONS` lives in memory and this host sleeps when idle, so a
+    session did not survive to the next day. A browser-side copy (lib/file-cache.ts) fixed
+    the same-device case, but by definition cannot restore a session on a DIFFERENT
+    device — for that the file has to live somewhere both devices can reach.
+
+    WHY THE SOURCE FILE AND NOT THE WHOLE SESSION STATE: the state is pandas DataFrames
+    plus a full undo history, and `store.save_all()` re-pickles every registered store
+    after each mutating request — doing that with 120k-row frames would be ruinous. The
+    file is the only irreplaceable part; everything else is REBUILT by re-reading it,
+    which is exactly what the existing recovery path already does.
+
+    `blob` is the file bytes. Size is capped by config.CLOUD_FILE_MAX_MB at the endpoint,
+    because a database is a poor object store and a free-tier one is a small poor object
+    store; over the cap we keep working WITHOUT cloud sync rather than fail the upload.
+    """
+    __tablename__ = "cloud_sessions"
+    __table_args__ = (UniqueConstraint("user_id", "session_id", name="uq_cloud_session"),)
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    # Not a ForeignKey on purpose: these tables are created by create_all with no
+    # migration step, and the rest of the app already references users by plain id.
+    user_id: Mapped[str] = mapped_column(String, index=True, nullable=False)
+    # The CLIENT's session id, so a device can ask for "that session" by the id it knows.
+    session_id: Mapped[str] = mapped_column(String, index=True, nullable=False)
+    name: Mapped[str] = mapped_column(String, default="Untitled session")
+    filename: Mapped[str] = mapped_column(String, default="upload.xlsx")
+    media_type: Mapped[str] = mapped_column(String, default="application/octet-stream")
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    blob: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+
+class ResultFile(Base):
+    """A generated result file (a processed spreadsheet), kept durably.
+
+    WHY: results were written only to `config.RESULTS_DIR` on the local filesystem. The
+    code even said they "survive a server restart" — true of a normal server, false here:
+    this host has no persistent disk, so every restart (which happens whenever it sleeps)
+    took the files with it. The visible effect was a download link that returned 404 a day
+    later, and version history / "restore an earlier version" breaking for the same reason.
+
+    Disk stays the fast path; this is the fallback that makes the link keep working. The
+    metadata is stored alongside the bytes ON PURPOSE — the in-memory index and its
+    index.json are equally ephemeral, so after a restart the row has to be able to describe
+    itself without them.
+    """
+    __tablename__ = "result_files"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    filename: Mapped[str] = mapped_column(String, default="result.xlsx")
+    media_type: Mapped[str] = mapped_column(String, default="application/octet-stream")
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    blob: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, index=True)
