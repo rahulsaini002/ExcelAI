@@ -17,6 +17,8 @@ from __future__ import annotations
 import time
 import uuid
 
+from . import store
+
 # The allow-list a plugin's steps must draw from — the app's known, trusted operations. An
 # unknown action (typo, or an attempt to smuggle something in) is rejected at publish time.
 SAFE_ACTIONS = frozenset({
@@ -29,8 +31,12 @@ SAFE_ACTIONS = frozenset({
     "detect_anomalies", "statistics", "chart", "dashboard", "goal_seek", "explain_changes",
 })
 
-_PLUGINS: dict[str, dict] = {}       # id -> plugin
-_INSTALLS: dict[str, set] = {}       # team_id -> {plugin_id, …}
+# PERSISTED, for the same reason as workflows: a published plugin and a team's installs are
+# deliberate user state, and losing them on every restart made the marketplace look broken
+# rather than empty. Both hold plain data (validated step lists / id sets), so snapshotting
+# is cheap.
+_PLUGINS: dict[str, dict] = store.register("plugins", store.load_dict("plugins"))
+_INSTALLS: dict[str, set] = store.register("plugin_installs", store.load_dict("plugin_installs"))
 _MAX = 500
 
 

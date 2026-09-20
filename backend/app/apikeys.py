@@ -5,7 +5,11 @@ ONCE at creation and never stored — only a SHA-256 hash is kept, so a leak of 
 can't reveal a usable key (the same reason password hashes exist). `verify` checks a
 presented key against the hashes; `revoke` disables one immediately.
 
-Pure in-memory store like the rest of the app's runtime state.
+PERSISTED via `store` (same as workspaces/connections/syncs). An API key is a CREDENTIAL
+the user is told to save and wire into their own scripts — losing it on a restart would
+silently break their integration with no way to tell why. In-memory was survivable for
+caches; it is not for credentials, and this app restarts often (the free hosting tier
+sleeps after 15 minutes idle). Only the HASH is persisted, never a usable key.
 """
 from __future__ import annotations
 
@@ -14,7 +18,10 @@ import secrets
 import time
 import uuid
 
-_KEYS: dict[str, dict] = {}  # key_id -> {id, team_id, label, hash, prefix, created_at, revoked}
+from . import store
+
+# key_id -> {id, team_id, label, hash, prefix, created_at, revoked}
+_KEYS: dict[str, dict] = store.register("apikeys", store.load_dict("apikeys"))
 
 
 def _hash(raw: str) -> str:

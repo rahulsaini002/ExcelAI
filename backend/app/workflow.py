@@ -25,9 +25,16 @@ from __future__ import annotations
 import time
 import uuid
 
+from . import store
 from .executor import MultiStepError, OperationError
 
-_WORKFLOWS: dict[str, dict] = {}
+# PERSISTED. A workflow is something the user deliberately SAVED — a named pipeline with a
+# trigger, often a schedule. In memory only, it vanished every time the host restarted
+# (which the free tier does whenever it sleeps), and worse, it did so SILENTLY: someone who
+# set up a nightly run would simply never see it run again, with nothing to indicate why.
+# Same class of bug as sessions not surviving to the next day. Stores plain dicts of plan
+# steps and trigger metadata, so it is cheap to snapshot.
+_WORKFLOWS: dict[str, dict] = store.register("workflows", store.load_dict("workflows"))
 
 TRIGGER_TYPES = ("manual", "schedule", "new_file", "anomaly")
 _DEFAULT_INTERVAL = 24 * 3600

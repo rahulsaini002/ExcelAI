@@ -58,6 +58,17 @@ TRUST_PROXY = os.getenv("SUMIO_TRUST_PROXY", "0").strip().lower() in {"1", "true
 #   MAX_SESSIONS      — cap how many sessions we keep in memory (oldest evicted).
 #   MAX_STATES        — cap the undo/redo stack kept per session.
 MAX_UPLOAD_MB = int(os.getenv("SUMIO_MAX_UPLOAD_MB", "250"))
+#   CLOUD_FILE_MAX_MB — largest file kept in the database for CROSS-DEVICE session
+#                       restore. Much smaller than MAX_UPLOAD_MB on purpose: a database is
+#                       a poor object store, and the free tier's is ~500 MB TOTAL, so a
+#                       couple of 250 MB uploads would exhaust it for every user at once.
+#                       Over the cap the upload still works normally — it just isn't
+#                       synced, and the caller is told so plainly. Raise it once files
+#                       live in real object storage.
+CLOUD_FILE_MAX_MB = int(os.getenv("SUMIO_CLOUD_FILE_MAX_MB", "20"))
+#   CLOUD_SESSIONS_PER_USER — how many saved sessions a user keeps; the oldest is dropped
+#                       beyond this, so one person cannot fill the database.
+CLOUD_SESSIONS_PER_USER = int(os.getenv("SUMIO_CLOUD_SESSIONS_PER_USER", "20"))
 MAX_SESSIONS = int(os.getenv("SUMIO_MAX_SESSIONS", "200"))
 MAX_STATES = int(os.getenv("SUMIO_MAX_STATES", "30"))
 
@@ -93,6 +104,12 @@ RESULTS_DIR = os.getenv(
     "SUMIO_RESULTS_DIR", str(pathlib.Path(__file__).resolve().parent.parent / ".sumio_results")
 )
 RESULTS_TTL_HOURS = int(os.getenv("SUMIO_RESULTS_TTL_HOURS", "168"))  # 7 days
+#   RESULT_FILE_MAX_MB — largest result ALSO kept in the database, so a download link and
+#                       version-history restore keep working after a restart (this host has
+#                       no persistent disk). Smaller than MAX_RESULTS_MB because a database
+#                       is a poor object store; over the cap the result still works, it just
+#                       lives on disk only.
+RESULT_FILE_MAX_MB = int(os.getenv("SUMIO_RESULT_FILE_MAX_MB", "20"))
 MAX_RESULTS_MB = int(os.getenv("SUMIO_MAX_RESULTS_MB", "600"))
 
 # Origins allowed to call the API (the Next.js frontend in dev).

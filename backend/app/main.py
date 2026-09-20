@@ -26,7 +26,7 @@ import pandas as pd
 from fastapi import Depends, FastAPI, File, Form, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from openpyxl import Workbook
 from openpyxl.chart import (
     AreaChart, BarChart, BubbleChart, DoughnutChart, LineChart, PieChart,
@@ -49,10 +49,10 @@ from openpyxl.utils import get_column_letter
 _PLACEHOLDER = re.compile(r"\{([^{}]+)\}")
 
 from . import (
-    apikeys, audit, auth, collab, compliance, compute_mode, config, connectors, digest,
-    distribution, execsummary, exports, fallback, guardrails, jobs, kg, lineage, llm,
-    marketplace, metrics, oidc, oplog, org, permissions, personalization, pii, quality, scale,
-    selfheal, slack, solver, store, sync, voice, workflow,
+    apikeys, audit, auth, cloudsessions, collab, compliance, compute_mode, config,
+    connectors, digest, distribution, execsummary, exports, fallback, guardrails, jobs, kg,
+    lineage, llm, marketplace, metrics, oidc, oplog, org, permissions, personalization, pii,
+    quality, resultstore, scale, selfheal, slack, solver, store, sync, voice, workflow,
 )
 from .db import init_db, session_scope
 from .executor import (
@@ -281,6 +281,9 @@ def _delete_result(rid: str) -> None:
         (_RESULTS_DIR / rid).unlink(missing_ok=True)
     except Exception:
         pass
+    # Drop the durable copy too, or an expired/evicted result would come back to life
+    # from the database — the cache and the durable store must agree on what exists.
+    resultstore.delete(rid)
 
 
 def _prune_results() -> None:
@@ -320,6 +323,10 @@ def _store_result(out_bytes: bytes, filename: str, media_type: str) -> str:
         "filename": filename, "media_type": media_type,
         "size": len(out_bytes), "created": time.time(),
     }
+    # Durable copy so the link still works after a restart — this host has no persistent
+    # disk, and both the file above and the index below are lost with it. Best-effort and
+    # size-capped: a result the user can already download must never fail over this.
+    resultstore.save(rid, out_bytes, filename, media_type)
     _prune_results()
     _save_results_index()
     return rid
@@ -331,6 +338,143 @@ _load_results_index()
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok", "model": config.MODEL}
+
+
+# --- Cross-device sessions --------------------------------------------------
+# Saving the SOURCE FILE against the account is what lets a session opened on a phone be
+# the one that was uploaded on a laptop. See app/cloudsessions.py for why it's the file
+# and not the session state, and for the two size bounds.
+
+
+@app.post("/sessions/sync")
+async def sessions_sync(
+    files: list[UploadFile] = File(...),
+    session_id: str = Form(""),
+    name: str = Form("Untitled session"),
+    user: "auth.User | None" = Depends(auth.current_user_optional),
+) -> JSONResponse:
+    """Store this session's source file against the signed-in account.
+
+    Deliberately NOT an error for anonymous callers: the workspace works fine without an
+    account, it simply can't follow you to another device. Saying so in the response beats
+    a 401 the UI would have to special-case — and beats implying it synced when it didn't.
+    """
+    if user is None:
+        return JSONResponse({"status": "ok", "synced": False, "reason": "not_signed_in"})
+    if not files:
+        return _error("Please upload a spreadsheet.", status=400)
+    first = files[0]
+    blob = await first.read()
+    try:
+        with session_scope() as db:
+            cloudsessions.save(
+                db, user.id, session_id, name,
+                first.filename or "upload.xlsx",
+                first.content_type or "application/octet-stream",
+                blob,
+            )
+    except cloudsessions.CloudSessionError as exc:
+        # An over-cap file is NOT a failed upload: the session still works on this device.
+        # Report it as a non-sync with the reason so the UI can say so honestly.
+        if exc.status == 413:
+            return JSONResponse(
+                {"status": "ok", "synced": False, "reason": "too_large", "detail": exc.message}
+            )
+        return _error(exc.message, status=exc.status)
+    return JSONResponse({"status": "ok", "synced": True})
+
+
+@app.get("/sessions")
+async def sessions_list(
+    user: "auth.User | None" = Depends(auth.current_user_optional),
+) -> JSONResponse:
+    """The signed-in user's saved sessions (metadata only — never the file bytes)."""
+    if user is None:
+        return JSONResponse({"status": "ok", "sessions": [], "signed_in": False})
+    with session_scope() as db:
+        return JSONResponse(
+            {"status": "ok", "signed_in": True, "sessions": cloudsessions.listing(db, user.id)}
+        )
+
+
+@app.post("/sessions/{session_id}/restore")
+async def sessions_restore(
+    session_id: str,
+    user: "auth.User" = Depends(auth.current_user),
+) -> JSONResponse:
+    """Rebuild a live session on THIS server from the stored file.
+
+    Reuses the same load path as /inspect, so a restored session is byte-for-byte the one
+    a fresh upload would produce — there is no second notion of "a session".
+    """
+    try:
+        with session_scope() as db:
+            row = cloudsessions.get(db, user.id, session_id)
+            blob, filename = row.blob, row.filename
+    except cloudsessions.CloudSessionError as exc:
+        return _error(exc.message, status=exc.status)
+
+    try:
+        data = load_files([(filename, blob)])
+    except ValueError as exc:
+        return _error(str(exc), status=400)
+    except llm.ModelUnavailableError as exc:
+        return _error(str(exc), status=503)
+    except Exception:
+        return _error(_INTERNAL_ERROR, status=500)
+
+    _remember_session(session_id, {
+        "tables": data.tables,
+        "primary": data.primary,
+        "exts": data.exts,
+        "notes": data.notes,
+    })
+    return JSONResponse({
+        "status": "ok",
+        "restored": True,
+        "filename": filename,
+        # Same shape as /inspect, from the same helper — a restored session must look
+        # identical to a freshly uploaded one.
+        "tables": _preview_payload(data.tables, data.notes),
+    })
+
+
+@app.post("/sessions/{session_id}/delete")
+async def sessions_delete(
+    session_id: str,
+    user: "auth.User" = Depends(auth.current_user),
+) -> JSONResponse:
+    """Forget a saved session. Deleting locally must delete the cloud copy too, or
+    "deleted" would be a lie the next device exposes."""
+    with session_scope() as db:
+        return JSONResponse({"status": "ok", "deleted": cloudsessions.delete(db, user.id, session_id)})
+
+
+@app.get("/limits")
+def limits() -> dict:
+    """The limits actually enforced on this deployment, so a client can state them
+    instead of guessing.
+
+    Added because the API Platform page displayed "60 requests/min" and a monthly quota
+    of 100,000 — neither of which exists here. The real gate is a per-IP request budget
+    (`_gate`/`_RATE`) plus an upload size cap; there is NO monthly quota, and saying so
+    is more useful than inventing one.
+
+    `requests_per_window` of 0 means unlimited (rate limiting disabled), which callers
+    must render as "no limit" rather than as zero requests allowed.
+    """
+    return {
+        "status": "ok",
+        "rate_limit": {
+            "requests_per_window": config.RATE_LIMIT,
+            "window_seconds": config.RATE_WINDOW,
+            "scope": "ip",
+            "enabled": config.RATE_LIMIT > 0,
+        },
+        "upload": {"max_mb": config.MAX_UPLOAD_MB},
+        # Stated explicitly so a UI never has to infer it from a missing field.
+        "monthly_quota": None,
+    }
 
 
 @app.get("/operations/compute-mode")
@@ -415,6 +559,46 @@ def _format_number(x: float, fmt: str | None) -> str:
     if abs(x) >= 10_000:
         return _abbrev(x)
     return f"{int(x):,}" if x == int(x) else f"{x:,.2f}"
+
+
+def _compute_kpi_explained(df: pd.DataFrame, metric: dict) -> tuple[str | None, str]:
+    """A KPI value PLUS a plain description of what it was computed from.
+
+    The basis exists because a number with the wrong label is more misleading than no
+    number. `agg="count"` ignores `column` entirely and returns the row count, so a block
+    titled "Orders" pointed at a student shortlist rendered "548" — a true row count
+    presented as a sales figure. Returning "count of rows" alongside it lets the caller
+    show the user what they are actually looking at.
+    """
+    value = _compute_kpi(df, metric)
+    if value is None:
+        return None, ""
+    agg = (metric.get("agg") or "").lower()
+    col = metric.get("column")
+    if agg == "count":
+        return value, "count of rows"
+    if agg == "count_distinct" and col:
+        return value, f"distinct values in {col}"
+    names = {"sum": "sum of", "mean": "average of", "average": "average of",
+             "min": "lowest", "max": "highest"}
+    if agg in names and col:
+        return value, f"{names[agg]} {col}"
+    return value, (f"from {col}" if col else "")
+
+
+def _kpi_reason(df: pd.DataFrame, metric: dict) -> str:
+    """Why a KPI could not be computed — specific enough to act on."""
+    col = metric.get("column")
+    agg = (metric.get("agg") or "").lower()
+    if not agg:
+        return "no way to measure this from the columns in this file"
+    if col and col not in df.columns:
+        return f"there is no '{col}' column in this file"
+    if col:
+        series = pd.to_numeric(df[col], errors="coerce").dropna()
+        if series.empty:
+            return f"'{col}' has no numeric values to {agg}"
+    return "this file has no column that fits this metric"
 
 
 def _compute_kpi(df: pd.DataFrame, metric: dict) -> str | None:
@@ -725,39 +909,103 @@ async def report_compute(
         for it in plan.get("items", [])
         if isinstance(it.get("index"), int) and it.get("metric")
     }
+    # Blocks the data genuinely cannot fill. Reported back rather than left blank: a
+    # report that silently comes out empty looks broken, and the user has no way to learn
+    # that the template simply didn't suit their file. Real case that prompted this: a
+    # campus-recruitment shortlist run through "Executive Summary" produced a blank Total
+    # Revenue, a blank Avg Order Value, and empty charts, with nothing saying why.
+    unfilled: list[dict] = []
+
+    def _cant(index: int, block: dict, reason: str) -> None:
+        unfilled.append({
+            "index": index,
+            "title": block.get("title") or block.get("type") or "Block",
+            "reason": reason,
+        })
+
     for i, b in enumerate(block_list):
         metric = metrics.get(i)
-        if not metric:
-            continue
         t = b.get("type")
+        if t == "narrative":
+            continue  # prose the user writes; nothing to compute
+        if not metric:
+            _cant(i, b, "no column in this file matches what this block measures")
+            continue
         if t == "kpi":
-            v = _compute_kpi(df, metric)
+            v, basis = _compute_kpi_explained(df, metric)
             if v is not None:
                 b["value"] = v
                 b["delta"] = None
-        elif t == "chart" and metric.get("group_by"):
-            s = _compute_series(df, metric)
+                # WHAT THE NUMBER ACTUALLY IS. Without this, a bare count rendered under a
+                # business label reads as that business metric: this endpoint returned
+                # "Orders 548" for a file of 548 STUDENTS, because the model mapped the
+                # block to a row count and nothing said so. The figure was real; the label
+                # was not. Naming the basis makes a mismatch visible instead of plausible.
+                b["basis"] = basis
+            else:
+                _cant(i, b, _kpi_reason(df, metric))
+        elif t == "chart":
+            s = _compute_series(df, metric) if metric.get("group_by") else []
             if s:
                 b["data"] = s
-        elif t == "table" and metric.get("group_by"):
-            tbl = _compute_table(df, metric)
+            else:
+                _cant(i, b, "needs a column to group by and a number to plot")
+        elif t == "table":
+            tbl = _compute_table(df, metric) if metric.get("group_by") else None
             if tbl:
                 b["columns"] = tbl["columns"]
                 b["rows"] = tbl["rows"]
+            else:
+                _cant(i, b, "needs a column to group rows by")
 
-    return JSONResponse({"status": "ok", "blocks": block_list})
+    return JSONResponse({
+        "status": "ok",
+        "blocks": block_list,
+        # The caller can now say "4 of 5 blocks couldn't be filled from this file, because…"
+        "unfilled": unfilled,
+        "filled": sum(1 for i, b in enumerate(block_list)
+                      if b.get("type") != "narrative"
+                      and not any(u["index"] == i for u in unfilled)),
+    })
 
 
 @app.api_route("/download/{result_id}", methods=["GET", "HEAD"])
 def download(result_id: str):
-    """Stream a generated result file from disk (the browser saves it straight to disk,
-    so a large file never lives in the page's memory; survives a server restart).
+    """Stream a generated result file, from disk when it's there and from the database
+    when it isn't.
+
+    The disk path is the fast one: FileResponse streams it, so a large file never sits in
+    this process's memory. But the disk here does NOT survive a restart (nor does the
+    in-memory index, nor index.json) — which is why a link that worked yesterday used to
+    404 today. The database fallback below is what makes the link keep working; the disk
+    copy is rebuilt on the way out so the next request is fast again.
+
     HEAD is supported so the frontend can check a file still exists before downloading."""
     meta = _RESULTS.get(result_id)
     path = _RESULTS_DIR / result_id
-    if not meta or not path.exists():
+    if meta and path.exists():
+        return FileResponse(path, media_type=meta["media_type"], filename=meta["filename"])
+
+    stored = resultstore.load(result_id)
+    if stored is None:
         return _error("That download has expired — please re-run the step.", status=404)
-    return FileResponse(path, media_type=meta["media_type"], filename=meta["filename"])
+    blob, filename, media_type = stored
+    try:
+        # Rehydrate the cache, and the index the metadata came from, so this costs the
+        # database read only once.
+        _RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(blob)
+        _RESULTS[result_id] = {
+            "filename": filename, "media_type": media_type,
+            "size": len(blob), "created": time.time(),
+        }
+        _save_results_index()
+        return FileResponse(path, media_type=media_type, filename=filename)
+    except Exception:
+        # Couldn't write the cache (read-only disk, full disk) — still serve the bytes.
+        return Response(content=blob, media_type=media_type, headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+        })
 
 
 @app.post("/undo")
@@ -970,27 +1218,7 @@ async def inspect(
         preview_tables = data.tables
         preview_notes = data.notes
 
-    tables = []
-    for name, df in preview_tables.items():
-        s = summarize_structure(df, sample_rows=5)
-        rc = s["row_count"]
-        note_parts = []
-        ocr_note = preview_notes.get(name, "")
-        if ocr_note:
-            note_parts.append(ocr_note)
-        if rc == 0:
-            note_parts.append("This sheet has no data rows.")
-        elif rc > 50_000:
-            note_parts.append(f"Large file ({rc:,} rows) — preview shows the first 5 rows.")
-        tables.append(
-            {
-                "name": name,
-                "row_count": rc,
-                "columns": s["columns"],
-                "sample_rows": s["sample_rows"],
-                "note": " ".join(note_parts) if note_parts else None,
-            }
-        )
+    tables = _preview_payload(preview_tables, preview_notes)
     return JSONResponse({
         "status": "ok",
         "tables": tables,
@@ -999,6 +1227,38 @@ async def inspect(
         "added": added_to_existing,
         "added_tables": list(data.tables) if added_to_existing else [],
     })
+
+
+def _preview_payload(tables: dict, notes: dict | None = None) -> list[dict]:
+    """The table preview the UI renders: columns + types, row count, 5 sample rows.
+
+    Extracted from /inspect so a session RESTORED from cloud storage is described exactly
+    the same way as one that was just uploaded — two hand-written copies of this would
+    drift, and the UI would show subtly different things depending on how the data arrived.
+    """
+    notes = notes or {}
+    out = []
+    for name, df in tables.items():
+        s = summarize_structure(df, sample_rows=5)
+        rc = s["row_count"]
+        note_parts = []
+        ocr_note = notes.get(name, "")
+        if ocr_note:
+            note_parts.append(ocr_note)
+        if rc == 0:
+            note_parts.append("This sheet has no data rows.")
+        elif rc > 50_000:
+            note_parts.append(f"Large file ({rc:,} rows) — preview shows the first 5 rows.")
+        out.append(
+            {
+                "name": name,
+                "row_count": rc,
+                "columns": s["columns"],
+                "sample_rows": s["sample_rows"],
+                "note": " ".join(note_parts) if note_parts else None,
+            }
+        )
+    return out
 
 
 def _shield_columns(shielded: list[str]) -> list[str]:
