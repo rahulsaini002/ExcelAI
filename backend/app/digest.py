@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterable
 
+from . import config
 from .db import session_scope
 from .models import DigestLog, RunEvent, User
 
@@ -121,7 +122,11 @@ def compose_digest(
 
     lines += [
         "",
-        "Pick up where you left off: https://sumio.app/workspace",
+        # Built from config.FRONTEND_URL like every other outbound link (password reset
+        # in auth.py, invites and the OIDC callback in main.py, /slack). This line alone
+        # hardcoded "https://sumio.app/workspace" — a domain we don't serve — so the one
+        # call-to-action in the weekly email led users away from the actual app.
+        f"Pick up where you left off: {config.FRONTEND_URL}/workspace",
         "",
         "— Sumio",
         "",
