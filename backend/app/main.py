@@ -49,7 +49,7 @@ from openpyxl.utils import get_column_letter
 _PLACEHOLDER = re.compile(r"\{([^{}]+)\}")
 
 from . import (
-    apikeys, audit, auth, cloudsessions, collab, compliance, compute_mode, config,
+    apikeys, audit, auth, autoreport, cloudsessions, collab, compliance, compute_mode, config,
     connectors, digest, distribution, execsummary, exports, fallback, guardrails, jobs, kg,
     lineage, llm, marketplace, metrics, oidc, oplog, org, permissions, personalization, pii,
     quality, resultstore, scale, selfheal, slack, solver, store, sync, voice, workflow,
@@ -851,6 +851,61 @@ async def report_export(report: str = Form(...)) -> JSONResponse:
         "media_type": media,
         "download_id": download_id,
         "file_base64": inline,
+    })
+
+
+@app.post("/report/auto")
+async def report_auto(files: list[UploadFile] = File(...)) -> JSONResponse:
+    """Generate a COMPLETE report from an uploaded file, with no template and no model call.
+
+    /report/compute starts from blocks someone chose in advance and asks the Brain to map
+    them onto the data, which fails whenever the file is not shaped the way the template
+    assumed — a recruitment shortlist run through a sales template produced blank revenue
+    blocks and an empty PDF. This starts from the DATA instead: it reads what is actually
+    there and decides what the report should be.
+
+    Deliberately model-free. Deciding that a file has 548 rows across 12 branches is a
+    data question, not a language one, and the free tier's daily cap should not be able to
+    stop someone getting a report. See app/autoreport.py.
+    """
+    if not files:
+        return _error("Please choose a data file to report on.", status=400)
+    too_big = _too_big(files)
+    if too_big:
+        return _error(too_big, status=413)
+    uploads = [(f.filename or "upload", await f.read()) for f in files]
+    too_big = _too_big_read(uploads)
+    if too_big:
+        return _error(too_big, status=413)
+    try:
+        data = load_files(uploads)
+    except ValueError as exc:
+        return _error(str(exc), status=400)
+    except llm.ModelUnavailableError as exc:
+        # Only reachable for a scanned image/PDF, where OCR genuinely needs the model.
+        return _error(str(exc), status=503)
+    except Exception:
+        return _error(_INTERNAL_ERROR, status=500)
+
+    primary = data.primary
+    df = data.tables.get(primary)
+    if df is None or not len(df):
+        return _error("That file has no data rows to report on.", status=400)
+
+    source = uploads[0][0]
+    blocks = autoreport.build(df, source=source, sheet=str(primary))
+    for i, b in enumerate(blocks):
+        b["id"] = f"auto-{i}"
+
+    # Other sheets are named rather than silently ignored, so nobody assumes the report
+    # covered a sheet it didn't.
+    others = [str(t) for t in data.tables if t != primary]
+    return JSONResponse({
+        "status": "ok",
+        "title": str(primary),
+        "source": source,
+        "blocks": blocks,
+        "other_sheets": others,
     })
 
 
