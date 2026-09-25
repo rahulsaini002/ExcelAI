@@ -23,6 +23,45 @@ def _looks_numeric(series: pd.Series) -> bool:
     return bool(pd.to_numeric(nonblank, errors="coerce").notna().all())
 
 
+def _is_serial(df: pd.DataFrame, col) -> bool:
+    """True for a numeric column that identifies rows rather than measuring anything.
+
+    Without this the summary narrated whatever numeric column came first, which on a real
+    file produced "Total S.NO. is 216.7K" and "largest contributor at 0% of S.NO." —
+    arithmetic that is perfectly correct and completely meaningless. A serial number is
+    not a quantity, so totalling or averaging it says nothing.
+
+    Two signals, either is enough: the column is NAMED like an identifier (reusing
+    kg._id_like so this codebase keeps one definition), or it is a near-unique run of
+    whole numbers, which is what a serial column looks like whatever it is called.
+    """
+    try:
+        from .kg import _id_like
+        if _id_like(col):
+            return True
+        series = pd.to_numeric(df[col], errors="coerce").dropna()
+        if len(series) > 10 and series.nunique() / len(series) > 0.98:
+            return bool((series % 1 == 0).all())
+    except Exception:
+        return False
+    return False
+
+
+# Measures whose values must not be added up. A percentage, a score, a rate or a GPA is
+# a LEVEL, not a quantity: summing 548 CGPAs gives a real number that means nothing, which
+# is the same failure as totalling a serial column. Averaging them is fine, so the range
+# insight still applies — only "total" and "share of total" are withheld.
+_NON_ADDITIVE_HINTS = (
+    "%", "percent", "pct", "rate", "ratio", "score", "cgpa", "gpa", "grade",
+    "avg", "average", "mean", "median", "index", "rating", "age",
+)
+
+
+def _is_additive(col) -> bool:
+    name = str(col).strip().lower()
+    return not any(h in name for h in _NON_ADDITIVE_HINTS)
+
+
 def _abbrev(x: float) -> str:
     """Compact human number: 4,820,000 -> 4.82M, 18204 -> 18.2K (matches the app's style)."""
     ax = abs(x)
@@ -92,7 +131,7 @@ def generate(df: pd.DataFrame, title: str | None = None) -> dict:
 
     n = len(df)
     cols = [str(c) for c in df.columns]
-    numeric = [c for c in df.columns if _looks_numeric(df[c])]
+    numeric = [c for c in df.columns if _looks_numeric(df[c]) and not _is_serial(df, c)]
 
     insights.append({"kind": "overview", "text": f"{n:,} rows across {len(cols)} columns.",
                      "figures": {"rows": n, "columns": len(cols)}})
@@ -103,16 +142,21 @@ def generate(df: pd.DataFrame, title: str | None = None) -> dict:
         metric = str(numeric[0])
         v = pd.to_numeric(df[numeric[0]], errors="coerce")
         total, avg, mn, mx = float(v.sum()), float(v.mean()), float(v.min()), float(v.max())
-        insights.append({"kind": "total", "text": f"Total {metric} is {_abbrev(total)}.",
-                         "figures": {"metric": metric, "total": round(total, 4)}})
+        additive = _is_additive(metric)
+        if additive:
+            insights.append({"kind": "total", "text": f"Total {metric} is {_abbrev(total)}.",
+                             "figures": {"metric": metric, "total": round(total, 4)}})
         insights.append({"kind": "range",
                          "text": f"{metric} averages {_abbrev(avg)}, ranging {_abbrev(mn)} to {_abbrev(mx)}.",
                          "figures": {"metric": metric, "avg": round(avg, 4), "min": mn, "max": mx}})
 
         # Top driver — only as a part-of-whole when contributions are non-negative and the
         # top is a sane 0–100% slice (mixed-sign data would give a fabricated-looking share).
-        cats = [c for c in df.columns if c not in numeric and 2 <= int(df[c].nunique(dropna=True)) < n]
-        if cats and total > 0:
+        # The category must also GROUP the data: a column with one distinct value per row
+        # (a Name) made a single person "the largest contributor", which is not a finding.
+        cats = [c for c in df.columns
+                if c not in numeric and 2 <= int(df[c].nunique(dropna=True)) <= min(40, n - 1)]
+        if additive and cats and total > 0:
             cat = str(cats[0])
             g = (pd.DataFrame({"_c": df[cats[0]].astype(str), "_v": v})
                  .dropna(subset=["_v"]).groupby("_c")["_v"].sum())
